@@ -204,6 +204,7 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     char* conn_syscdcdb = NULL;
 
     PyObject *retcode;
+
     PyObject *py_conn_user = NULL;
     PyObject *py_conn_passwd = NULL;
 
