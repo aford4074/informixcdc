@@ -151,7 +151,6 @@ InformixCdc_getis_connected(InformixCdcObject *self, void *closure)
         return NULL;
     }
 
-    //Py_INCREF(is_connected);
     return is_connected;
 }
 
@@ -165,7 +164,6 @@ InformixCdc_getsession_id(InformixCdcObject *self, void *closure)
         return NULL;
     }
 
-    //Py_INCREF(session_id);
     return session_id;
 }
 
@@ -255,7 +253,6 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
     else {
         sqlcode = PyInt_FromLong(SQLCODE);
-        //Py_INCREF(sqlcode);
         return sqlcode;
     }
 
@@ -277,7 +274,6 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         sqlcode = PyInt_FromLong(0L);
     }
 
-    //Py_INCREF(sqlcode);
     return sqlcode;
 }
 
@@ -319,12 +315,10 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
     if (SQLCODE != 0) {
         sqlcode = PyInt_FromLong(SQLCODE);
-        //Py_INCREF(sqlcode);
         return sqlcode;
     }
     else if (retval < 0) {
         sqlcode = PyInt_FromLong(retval);
-        //Py_INCREF(sqlcode);
         return sqlcode;
     }
 
@@ -344,7 +338,6 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         sqlcode = PyInt_FromLong(0L);
     }
 
-    //Py_INCREF(sqlcode);
     return sqlcode;
 }
 
@@ -375,7 +368,6 @@ InformixCdc_activate(InformixCdcObject *self)
         sqlcode = PyInt_FromLong(0L);
     }
 
-    //Py_INCREF(sqlcode);
     return sqlcode;
 }
 
