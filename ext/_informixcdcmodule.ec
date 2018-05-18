@@ -7,6 +7,8 @@
 #define DEFAULT_TIMEOUT 60L
 #define DEFAULT_MAX_RECORDS 100L
 #define DEFAULT_SYSCDCDB "syscdcv1"
+EXEC SQL define TABLENAME_LEN 768;
+EXEC SQL define COLARG_LEN 1024;
 
 static PyObject *ErrorObject;
 
@@ -16,8 +18,8 @@ typedef struct {
     int is_connected;
     $integer session_id;
     PyObject *dbservername;
-    PyObject *timeout;
-    PyObject *max_records;
+    int timeout;
+    int max_records;
     PyObject *syscdcdb;
 } InformixCdcObject;
 
@@ -29,8 +31,6 @@ static void
 InformixCdc_dealloc(InformixCdcObject* self)
 {
     Py_XDECREF(self->dbservername);
-    Py_XDECREF(self->timeout);
-    Py_XDECREF(self->max_records);
     Py_XDECREF(self->syscdcdb);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
@@ -52,17 +52,8 @@ InformixCdc_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
             return NULL;
         }
 
-        self->timeout = PyInt_FromLong(0L);
-        if (self->timeout == NULL) {
-            Py_DECREF(self);
-            return NULL;
-        }
-
-        self->max_records = PyInt_FromLong(0L);
-        if (self->max_records == NULL) {
-            Py_DECREF(self);
-            return NULL;
-        }
+        self->timeout = -1;
+        self->max_records = -1;
 
         self->syscdcdb = PyString_FromString("");
         if (self->syscdcdb == NULL) {
@@ -78,8 +69,6 @@ static int
 InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
     PyObject *dbservername = NULL;
-    PyObject *timeout = NULL;
-    PyObject *max_records = NULL;
     PyObject *syscdcdb = NULL;
     PyObject *tmp;
 
@@ -87,8 +76,8 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
                              "syscdcdb", NULL };
 
     if (! PyArg_ParseTupleAndKeywords(args, kwds, "S|iiS:init", kwlist,
-                                      &dbservername, &timeout, &max_records,
-                                      &syscdcdb)) {
+                                      &dbservername, &self->timeout,
+                                      &self->max_records, &syscdcdb)) {
         return -1;
     }
 
@@ -99,21 +88,13 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     self->dbservername = dbservername;
     Py_DECREF(tmp);
 
-    if (! timeout) {
-        timeout = PyInt_FromLong(DEFAULT_TIMEOUT);
+    if (self->timeout <= 0) {
+        self->timeout = 30;
     }
-    tmp = self->timeout;
-    Py_INCREF(timeout);
-    self->timeout = timeout;
-    Py_DECREF(tmp);
 
-    if (! max_records) {
-        max_records = PyInt_FromLong(DEFAULT_MAX_RECORDS);
+    if (self->max_records <= 0) {
+        self->max_records = 100;
     }
-    tmp = self->max_records;
-    Py_INCREF(max_records);
-    self->max_records = max_records;
-    Py_DECREF(tmp);
 
     if (! syscdcdb) {
         syscdcdb = PyString_FromString(DEFAULT_SYSCDCDB);
@@ -136,14 +117,14 @@ static PyMemberDef InformixCdc_members[] = {
     },
     {
         "timeout",
-        T_OBJECT_EX,
+        T_INT,
         offsetof(InformixCdcObject, timeout),
         READONLY,
         PyDoc_STR("timeout in seconds to block while waiting for CDC events"),
     },
     {
         "max_records",
-        T_OBJECT_EX,
+        T_INT,
         offsetof(InformixCdcObject, max_records),
         READONLY,
         PyDoc_STR("max records CDC can return in one event message"),
@@ -170,7 +151,7 @@ InformixCdc_getis_connected(InformixCdcObject *self, void *closure)
         return NULL;
     }
 
-    Py_INCREF(is_connected);
+    //Py_INCREF(is_connected);
     return is_connected;
 }
 
@@ -184,7 +165,7 @@ InformixCdc_getsession_id(InformixCdcObject *self, void *closure)
         return NULL;
     }
 
-    Py_INCREF(session_id);
+    //Py_INCREF(session_id);
     return session_id;
 }
 
@@ -274,19 +255,12 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
     else {
         sqlcode = PyInt_FromLong(SQLCODE);
-        Py_INCREF(sqlcode);
+        //Py_INCREF(sqlcode);
         return sqlcode;
     }
 
-    timeout = PyInt_AsLong(self->timeout);
-    if (timeout == -1 && PyErr_Occurred() != NULL) {
-        return NULL;
-    }
-
-    max_records = PyInt_AsLong(self->max_records);
-    if (max_records == -1 && PyErr_Occurred() != NULL) {
-        return NULL;
-    }
+    timeout = self->timeout;
+    max_records = self->max_records;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_opensess(
         :conn_dbservername, 0, :timeout, :max_records, 1, 1
@@ -294,20 +268,144 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
     if (SQLCODE != 0) {
         sqlcode = PyInt_FromLong(SQLCODE);
-        Py_INCREF(sqlcode);
-        return sqlcode;
     }
     else if (session_id < 0) {
         sqlcode = PyInt_FromLong(session_id);
-        Py_INCREF(sqlcode);
+    }
+    else {
+        self->session_id = session_id;
+        sqlcode = PyInt_FromLong(0L);
+    }
+
+    //Py_INCREF(sqlcode);
+    return sqlcode;
+}
+
+static PyObject *
+InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char *cdc_table = NULL;
+    char *cdc_columns = NULL;
+    $integer session_id;
+    $integer table_id = 0;
+    $integer retval;
+    EXEC SQL END DECLARE SECTION;
+
+    PyObject *sqlcode;
+    PyObject *py_cdc_table = NULL;
+    PyObject *py_cdc_columns = NULL;
+
+    static char *kwlist[] = {"table", "columns", NULL };
+
+    if (! PyArg_ParseTupleAndKeywords(args, kwds, "SS:enable", kwlist,
+                                      &py_cdc_table, &py_cdc_columns)) {
+        return NULL;
+    }
+
+    cdc_table = PyString_AsString(py_cdc_table);
+    if (cdc_table == NULL ) {
+        return NULL;
+    }
+
+    cdc_columns = PyString_AsString(py_cdc_columns);
+    if (cdc_columns == NULL) {
+        return NULL;
+    }
+
+    EXEC SQL EXECUTE FUNCTION informix.cdc_set_fullrowlogging(
+        :cdc_table, 1)
+    INTO :retval;
+
+    if (SQLCODE != 0) {
+        sqlcode = PyInt_FromLong(SQLCODE);
+        //Py_INCREF(sqlcode);
+        return sqlcode;
+    }
+    else if (retval < 0) {
+        sqlcode = PyInt_FromLong(retval);
+        //Py_INCREF(sqlcode);
         return sqlcode;
     }
 
-    self->session_id = session_id;
+    session_id = self->session_id;
 
-    sqlcode = PyInt_FromLong(0L);
-    Py_INCREF(sqlcode);
+    EXEC SQL EXECUTE FUNCTION informix.cdc_startcapture(
+        :session_id, 0, :cdc_table, :cdc_columns, :table_id
+    ) INTO :retval;
+
+    if (SQLCODE != 0) {
+        sqlcode = PyInt_FromLong(SQLCODE);
+    }
+    else if (retval < 0) {
+        sqlcode = PyInt_FromLong(retval);
+    }
+    else {
+        sqlcode = PyInt_FromLong(0L);
+    }
+
+    //Py_INCREF(sqlcode);
     return sqlcode;
+}
+
+static PyObject *
+InformixCdc_activate(InformixCdcObject *self)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    $integer session_id;
+    bigint lsn = 0;
+    $integer retval;
+    EXEC SQL END DECLARE SECTION;
+
+    PyObject *sqlcode;
+
+    session_id = self->session_id;
+
+    EXEC SQL EXECUTE FUNCTION informix.cdc_activatesess(
+        :session_id, :lsn
+    ) INTO :retval;
+
+    if (SQLCODE != 0) {
+        sqlcode = PyInt_FromLong(SQLCODE);
+    }
+    else if (retval < 0) {
+        sqlcode = PyInt_FromLong(retval);
+    }
+    else {
+        sqlcode = PyInt_FromLong(0L);
+    }
+
+    //Py_INCREF(sqlcode);
+    return sqlcode;
+}
+
+static PyObject *
+InformixCdc_read(InformixCdcObject *self)
+{
+    int bytes_read;
+    int lo_read_err = 0;
+    char *buffer = NULL;
+    PyObject *py_buffer = NULL;
+
+    buffer = PyMem_Malloc(1024);
+    if (! buffer) {
+        return PyErr_NoMemory();
+    }
+
+    bytes_read = ifx_lo_read(self->session_id, buffer, 1024, &lo_read_err);
+    if (bytes_read < 0 || lo_read_err < 0) {
+        PyMem_Free(buffer);
+        return NULL;
+    }
+
+    py_buffer = PyString_FromStringAndSize(buffer, bytes_read);
+    if (py_buffer == NULL) {
+        PyMem_Free(buffer);
+        return NULL;
+    }
+
+    PyMem_Free(buffer);
+    return py_buffer;
 }
 
 static PyMethodDef InformixCdc_methods[] = {
@@ -316,6 +414,24 @@ static PyMethodDef InformixCdc_methods[] = {
         (PyCFunction)InformixCdc_connect,
         METH_VARARGS | METH_KEYWORDS,
         PyDoc_STR("connect() -> None")
+    },
+    {
+        "enable",
+        (PyCFunction)InformixCdc_enable,
+        METH_VARARGS | METH_KEYWORDS,
+        PyDoc_STR("enable() -> None")
+    },
+    {
+        "activate",
+        (PyCFunction)InformixCdc_activate,
+        METH_NOARGS,
+        PyDoc_STR("activate() -> None")
+    },
+    {
+        "read",
+        (PyCFunction)InformixCdc_read,
+        METH_NOARGS,
+        PyDoc_STR("read() -> None")
     },
     {   /* sentinel */
         NULL,
