@@ -193,17 +193,17 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     EXEC SQL BEGIN DECLARE SECTION;
     char conn_string[255];
     char* conn_dbservername = NULL;
-    char *conn_name = NULL;
+    char *conn_name = self->name;
     char *conn_user = NULL;
     char *conn_passwd = NULL;
-    long timeout;
-    long max_records;
+    long timeout = self->timeout;
+    long max_records = self->max_records;
     $integer session_id;
     EXEC SQL END DECLARE SECTION;
 
     char* conn_syscdcdb = NULL;
 
-    PyObject *sqlcode;
+    PyObject *retcode;
     PyObject *py_conn_user = NULL;
     PyObject *py_conn_passwd = NULL;
 
@@ -238,7 +238,6 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    conn_name = self->name;
     sprintf(conn_string, "%s@%s", conn_syscdcdb, conn_dbservername);
 
     if (conn_user && conn_passwd) {
@@ -252,29 +251,26 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         self->is_connected = 1;
     }
     else {
-        sqlcode = PyInt_FromLong(SQLCODE);
-        return sqlcode;
+        retcode = PyInt_FromLong(SQLCODE);
+        return retcode;
     }
-
-    timeout = self->timeout;
-    max_records = self->max_records;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_opensess(
         :conn_dbservername, 0, :timeout, :max_records, 1, 1
     ) INTO :session_id;
 
     if (SQLCODE != 0) {
-        sqlcode = PyInt_FromLong(SQLCODE);
+        retcode = PyInt_FromLong(SQLCODE);
     }
     else if (session_id < 0) {
-        sqlcode = PyInt_FromLong(session_id);
+        retcode = PyInt_FromLong(session_id);
     }
     else {
         self->session_id = session_id;
-        sqlcode = PyInt_FromLong(0L);
+        retcode = PyInt_FromLong(0L);
     }
 
-    return sqlcode;
+    return retcode;
 }
 
 static PyObject *
@@ -283,12 +279,12 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     EXEC SQL BEGIN DECLARE SECTION;
     char *cdc_table = NULL;
     char *cdc_columns = NULL;
-    $integer session_id;
+    $integer session_id = self->session_id;
     $integer table_id = 0;
     $integer retval;
     EXEC SQL END DECLARE SECTION;
 
-    PyObject *sqlcode;
+    PyObject *retcode;
     PyObject *py_cdc_table = NULL;
     PyObject *py_cdc_columns = NULL;
 
@@ -310,65 +306,61 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_set_fullrowlogging(
-        :cdc_table, 1)
-    INTO :retval;
+        :cdc_table, 1
+    ) INTO :retval;
 
     if (SQLCODE != 0) {
-        sqlcode = PyInt_FromLong(SQLCODE);
-        return sqlcode;
+        retcode = PyInt_FromLong(SQLCODE);
+        return retcode;
     }
     else if (retval < 0) {
-        sqlcode = PyInt_FromLong(retval);
-        return sqlcode;
+        retcode = PyInt_FromLong(retval);
+        return retcode;
     }
-
-    session_id = self->session_id;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_startcapture(
         :session_id, 0, :cdc_table, :cdc_columns, :table_id
     ) INTO :retval;
 
     if (SQLCODE != 0) {
-        sqlcode = PyInt_FromLong(SQLCODE);
+        retcode = PyInt_FromLong(SQLCODE);
     }
     else if (retval < 0) {
-        sqlcode = PyInt_FromLong(retval);
+        retcode = PyInt_FromLong(retval);
     }
     else {
-        sqlcode = PyInt_FromLong(0L);
+        retcode = PyInt_FromLong(0L);
     }
 
-    return sqlcode;
+    return retcode;
 }
 
 static PyObject *
 InformixCdc_activate(InformixCdcObject *self)
 {
     EXEC SQL BEGIN DECLARE SECTION;
-    $integer session_id;
+    $integer session_id = self->session_id;
     bigint lsn = 0;
     $integer retval;
     EXEC SQL END DECLARE SECTION;
 
-    PyObject *sqlcode;
-
-    session_id = self->session_id;
+    PyObject *retcode;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_activatesess(
         :session_id, :lsn
     ) INTO :retval;
 
     if (SQLCODE != 0) {
-        sqlcode = PyInt_FromLong(SQLCODE);
+        retcode = PyInt_FromLong(SQLCODE);
     }
     else if (retval < 0) {
-        sqlcode = PyInt_FromLong(retval);
+        retcode = PyInt_FromLong(retval);
     }
     else {
-        sqlcode = PyInt_FromLong(0L);
+        retcode = PyInt_FromLong(0L);
     }
 
-    return sqlcode;
+    return retcode;
 }
 
 static PyObject *
@@ -627,26 +619,30 @@ init_informixcdc(void)
 
     /* Create the module and add the functions */
     m = Py_InitModule3("_informixcdc", informixcdc_methods, module_doc);
-    if (m == NULL)
+    if (m == NULL) {
         return;
+    }
 
     /* Add some symbolic constants to the module */
     if (ErrorObject == NULL) {
         ErrorObject = PyErr_NewException("informixcdc.error", NULL, NULL);
-        if (ErrorObject == NULL)
+        if (ErrorObject == NULL) {
             return;
+        }
     }
     Py_INCREF(ErrorObject);
     PyModule_AddObject(m, "error", ErrorObject);
 
     /* Add Str */
-    if (PyType_Ready(&Str_Type) < 0)
+    if (PyType_Ready(&Str_Type) < 0) {
         return;
+    }
     PyModule_AddObject(m, "Str", (PyObject *)&Str_Type);
 
     /* Add Null */
-    if (PyType_Ready(&Null_Type) < 0)
+    if (PyType_Ready(&Null_Type) < 0) {
         return;
+    }
     PyModule_AddObject(m, "Null", (PyObject *)&Null_Type);
 
     Py_INCREF(&InformixCdc_Type);
