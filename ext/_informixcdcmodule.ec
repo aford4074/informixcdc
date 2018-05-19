@@ -12,7 +12,7 @@
 #define DEFAULT_SYSCDCDB "syscdcv1"
 #define CONNNAME_LEN 50
 #define CONNSTRING_LEN 512
-#define LO_BYTES_PER_READ 65536
+#define LO_BYTES_PER_READ 1000000000 //65536
 #define DATABUFFER_SIZE LO_BYTES_PER_READ * 2
 EXEC SQL define TABLENAME_LEN 768;
 EXEC SQL define COLARG_LEN 1024;
@@ -126,7 +126,6 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     Py_DECREF(tmp);
 
     if (self->lo_buffer == NULL) {
-        printf("hellooooo\n");
         self->lo_buffer = PyMem_Malloc(DATABUFFER_SIZE);
         if (! self->lo_buffer) {
             return -1;
@@ -429,7 +428,7 @@ static PyObject *
 InformixCdc_iternext(InformixCdcObject *self)
 {
     int bytes_read;
-    int lo_read_err = 0;
+    mint lo_read_err = 0;
     int rc;
     int4 header_sz;
     int4 payload_sz;
@@ -439,7 +438,6 @@ InformixCdc_iternext(InformixCdcObject *self)
     PyObject *py_buffer = NULL;
 
     while (1) {
-        printf("looooooooop\n");
         /* if a partial record or we've got nothing in the buffer, */
         /* we need to read from the SLOB */
         /* if a partial record we need to copy the partial to the head of lo_buffer */
@@ -478,7 +476,7 @@ InformixCdc_iternext(InformixCdcObject *self)
             }
 
             record_sz = header_sz + payload_sz;
-            printf("%d %d %d %d %d\n", header_sz, payload_sz, packet_scheme, record_number, record_sz);
+            //printf("%d %d %d %d %d\n", header_sz, payload_sz, packet_scheme, record_number, record_sz);
             if (self->bytes_in_buffer >= record_sz) {
                 // we have enough to extract the record
                 py_buffer = PyString_FromStringAndSize(self->next_record_start,
@@ -501,31 +499,13 @@ InformixCdc_iternext(InformixCdcObject *self)
 }
 
 static PyObject *
-InformixCdc_read(InformixCdcObject *self)
+XInformixCdc_iternext(InformixCdcObject *self)
 {
-    int bytes_read;
-    int lo_read_err = 0;
-    char *buffer = NULL;
     PyObject *py_buffer = NULL;
-
-    buffer = PyMem_Malloc(DATABUFFER_SIZE);
-    if (! buffer) {
-        return PyErr_NoMemory();
-    }
-
-    bytes_read = ifx_lo_read(self->session_id, buffer, LO_BYTES_PER_READ, &lo_read_err);
-    if (bytes_read < 0 || lo_read_err < 0) {
-        PyMem_Free(buffer);
-        return NULL;
-    }
-
-    py_buffer = PyString_FromStringAndSize(buffer, bytes_read);
+    py_buffer = PyString_FromString("hello");
     if (py_buffer == NULL) {
-        PyMem_Free(buffer);
         return NULL;
     }
-
-    PyMem_Free(buffer);
     return py_buffer;
 }
 
@@ -547,12 +527,6 @@ static PyMethodDef InformixCdc_methods[] = {
         (PyCFunction)InformixCdc_activate,
         METH_NOARGS,
         PyDoc_STR("activate() -> None")
-    },
-    {
-        "read",
-        (PyCFunction)InformixCdc_read,
-        METH_NOARGS,
-        PyDoc_STR("read() -> None")
     },
     {   /* sentinel */
         NULL,
