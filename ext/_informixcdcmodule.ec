@@ -12,7 +12,7 @@
 #define DEFAULT_SYSCDCDB "syscdcv1"
 #define CONNNAME_LEN 50
 #define CONNSTRING_LEN 512
-#define LO_BYTES_PER_READ 1000000000 //65536
+#define LO_BYTES_PER_READ 65536
 #define DATABUFFER_SIZE LO_BYTES_PER_READ * 2
 EXEC SQL define TABLENAME_LEN 768;
 EXEC SQL define COLARG_LEN 1024;
@@ -128,6 +128,7 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     if (self->lo_buffer == NULL) {
         self->lo_buffer = PyMem_Malloc(DATABUFFER_SIZE);
         if (! self->lo_buffer) {
+            PyErr_SetString(PyExc_MemoryError, "cannot allocate lo_buffer");
             return -1;
         }
     }
@@ -496,17 +497,6 @@ InformixCdc_iternext(InformixCdcObject *self)
             self->partial_record_bytes = self->bytes_in_buffer;
         }
     }
-}
-
-static PyObject *
-XInformixCdc_iternext(InformixCdcObject *self)
-{
-    PyObject *py_buffer = NULL;
-    py_buffer = PyString_FromString("hello");
-    if (py_buffer == NULL) {
-        return NULL;
-    }
-    return py_buffer;
 }
 
 static PyMethodDef InformixCdc_methods[] = {

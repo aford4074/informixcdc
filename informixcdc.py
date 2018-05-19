@@ -44,8 +44,13 @@ def main():
     print 'enable()', cdc.enable("stocks:informix.cdc_test", "field1,field2")
     print 'activate()', cdc.activate()
 
-    for record in cdc:
-        print record.__repr__()
+    while True:
+        i = 0
+        for record in cdc:
+            i += 1
+            if i % 10000 == 0:
+                break
+            print record.__repr__()
 
 if __name__ == '__main__':
     main()
