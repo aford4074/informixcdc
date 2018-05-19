@@ -4,23 +4,38 @@
 #include <Python.h>
 #include "structmember.h"
 
-#define DEFAULT_TIMEOUT 60L
-#define DEFAULT_MAX_RECORDS 100L
+#define BYTESHIFT 8
+#define BYTEMASK 0xFF
+
+#define DEFAULT_TIMEOUT 60
+#define DEFAULT_MAX_RECORDS 100
 #define DEFAULT_SYSCDCDB "syscdcv1"
+#define CONNNAME_LEN 50
+#define CONNSTRING_LEN 512
+#define LO_BYTES_PER_READ 65536
+#define DATABUFFER_SIZE LO_BYTES_PER_READ * 2
 EXEC SQL define TABLENAME_LEN 768;
 EXEC SQL define COLARG_LEN 1024;
+EXEC SQL define CDC_MAJ_VER 1;
+EXEC SQL define CDC_MIN_VER 1;
+EXEC SQL define FULLROWLOG_OFF 0;
+EXEC SQL define FULLROWLOG_ON 1;
 
 static PyObject *ErrorObject;
 
 typedef struct {
     PyObject_HEAD
-    char name[30];
+    char name[CONNNAME_LEN];
     int is_connected;
     $integer session_id;
     PyObject *dbservername;
     int timeout;
     int max_records;
     PyObject *syscdcdb;
+    char *lo_buffer;
+    char *next_record_start;
+    int partial_record_bytes;
+    int bytes_in_buffer;
 } InformixCdcObject;
 
 static PyTypeObject InformixCdc_Type;
@@ -32,6 +47,7 @@ InformixCdc_dealloc(InformixCdcObject* self)
 {
     Py_XDECREF(self->dbservername);
     Py_XDECREF(self->syscdcdb);
+    PyMem_Free(self->lo_buffer);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -60,6 +76,11 @@ InformixCdc_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
             Py_DECREF(self);
             return NULL;
         }
+
+        self->lo_buffer = NULL;
+        self->next_record_start = NULL;
+        self->partial_record_bytes = 0;
+        self->bytes_in_buffer = 0;
     }
 
     return (PyObject *)self;
@@ -89,11 +110,11 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     Py_DECREF(tmp);
 
     if (self->timeout <= 0) {
-        self->timeout = 30;
+        self->timeout = DEFAULT_TIMEOUT;
     }
 
     if (self->max_records <= 0) {
-        self->max_records = 100;
+        self->max_records = DEFAULT_MAX_RECORDS;
     }
 
     if (! syscdcdb) {
@@ -103,6 +124,18 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     Py_INCREF(syscdcdb);
     self->syscdcdb = syscdcdb;
     Py_DECREF(tmp);
+
+    if (self->lo_buffer == NULL) {
+        printf("hellooooo\n");
+        self->lo_buffer = PyMem_Malloc(DATABUFFER_SIZE);
+        if (! self->lo_buffer) {
+            return -1;
+        }
+    }
+
+    self->next_record_start = NULL;
+    self->partial_record_bytes = 0;
+    self->bytes_in_buffer = 0;
 
     return 0;
 }
@@ -191,7 +224,7 @@ static PyObject *
 InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
     EXEC SQL BEGIN DECLARE SECTION;
-    char conn_string[255];
+    char conn_string[CONNSTRING_LEN];
     char* conn_dbservername = NULL;
     char *conn_name = self->name;
     char *conn_user = NULL;
@@ -257,7 +290,7 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_opensess(
-        :conn_dbservername, 0, :timeout, :max_records, 1, 1
+        :conn_dbservername, 0, :timeout, :max_records, CDC_MAJ_VER, CDC_MIN_VER
     ) INTO :session_id;
 
     if (SQLCODE != 0) {
@@ -307,7 +340,7 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_set_fullrowlogging(
-        :cdc_table, 1
+        :cdc_table, FULLROWLOG_ON
     ) INTO :retval;
 
     if (SQLCODE != 0) {
@@ -365,6 +398,109 @@ InformixCdc_activate(InformixCdcObject *self)
 }
 
 static PyObject *
+InformixCdc_iter(InformixCdcObject *self)
+{
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static int4
+ld4 (char *p) {
+    int4    rtn =
+            ((((((((int4) p[0]
+        << BYTESHIFT) + (p[1] & BYTEMASK))
+        << BYTESHIFT) + (p[2] & BYTEMASK))
+        << BYTESHIFT) + (p[3] & BYTEMASK)));
+    return rtn;
+}
+
+static int
+cdc_extract_header(char *record, int *header_sz, int *payload_sz,
+                   int *packet_scheme, int *record_number) {
+    *header_sz = ld4(record);
+    *payload_sz = ld4(record + 4);
+    *packet_scheme = ld4(record + 8);
+    *record_number = ld4(record + 12);
+
+    return 1;
+}
+
+static PyObject *
+InformixCdc_iternext(InformixCdcObject *self)
+{
+    int bytes_read;
+    int lo_read_err = 0;
+    int rc;
+    int4 header_sz;
+    int4 payload_sz;
+    int4 packet_scheme;
+    int4 record_number;
+    int4 record_sz;
+    PyObject *py_buffer = NULL;
+
+    while (1) {
+        printf("looooooooop\n");
+        /* if a partial record or we've got nothing in the buffer, */
+        /* we need to read from the SLOB */
+        /* if a partial record we need to copy the partial to the head of lo_buffer */
+        if (self->partial_record_bytes > 0 || self->bytes_in_buffer == 0) {
+            if (self->partial_record_bytes > 0) {
+                memcpy(self->lo_buffer, self->next_record_start, self->partial_record_bytes);
+                bytes_read = ifx_lo_read(self->session_id,
+                                         &self->lo_buffer[self->partial_record_bytes],
+                                         LO_BYTES_PER_READ, &lo_read_err);
+                self->partial_record_bytes = 0;
+            }
+            else {
+                bytes_read = ifx_lo_read(self->session_id,
+                                         self->lo_buffer,
+                                         LO_BYTES_PER_READ, &lo_read_err);
+            }
+
+            if (bytes_read <= 0 || lo_read_err < 0) {
+                return NULL;
+            }
+
+            self->next_record_start = self->lo_buffer;
+            self->bytes_in_buffer += bytes_read;
+        }
+
+        if (self->bytes_in_buffer >= 16) {
+            // we have enough to extract the record size
+            rc = cdc_extract_header(self->next_record_start,
+                                    &header_sz,
+                                    &payload_sz,
+                                    &packet_scheme,
+                                    &record_number);
+
+            if (rc != 1) {
+                return NULL;
+            }
+
+            record_sz = header_sz + payload_sz;
+            printf("%d %d %d %d %d\n", header_sz, payload_sz, packet_scheme, record_number, record_sz);
+            if (self->bytes_in_buffer >= record_sz) {
+                // we have enough to extract the record
+                py_buffer = PyString_FromStringAndSize(self->next_record_start,
+                                                       record_sz);
+                if (py_buffer == NULL) {
+                    return NULL;
+                }
+                self->next_record_start += record_sz;
+                self->bytes_in_buffer -= record_sz;
+                return py_buffer;
+            }
+            else {
+                self->partial_record_bytes = self->bytes_in_buffer;
+            }
+        }
+        else {
+            self->partial_record_bytes = self->bytes_in_buffer;
+        }
+    }
+}
+
+static PyObject *
 InformixCdc_read(InformixCdcObject *self)
 {
     int bytes_read;
@@ -372,12 +508,12 @@ InformixCdc_read(InformixCdcObject *self)
     char *buffer = NULL;
     PyObject *py_buffer = NULL;
 
-    buffer = PyMem_Malloc(1024);
+    buffer = PyMem_Malloc(DATABUFFER_SIZE);
     if (! buffer) {
         return PyErr_NoMemory();
     }
 
-    bytes_read = ifx_lo_read(self->session_id, buffer, 1024, &lo_read_err);
+    bytes_read = ifx_lo_read(self->session_id, buffer, LO_BYTES_PER_READ, &lo_read_err);
     if (bytes_read < 0 || lo_read_err < 0) {
         PyMem_Free(buffer);
         return NULL;
@@ -453,8 +589,8 @@ static PyTypeObject InformixCdc_Type = {
     0,                      /*tp_clear*/
     0,                      /*tp_richcompare*/
     0,                      /*tp_weaklistoffset*/
-    0,                      /*tp_iter*/
-    0,                      /*tp_iternext*/
+    (getiterfunc)InformixCdc_iter,                      /*tp_iter*/
+    (iternextfunc)InformixCdc_iternext,                      /*tp_iternext*/
     InformixCdc_methods,                      /*tp_methods*/
     InformixCdc_members,                      /*tp_members*/
     InformixCdc_getseters,                      /*tp_getset*/
