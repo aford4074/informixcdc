@@ -36,21 +36,17 @@ def memleak_tests():
             break
 
 def main():
-    cdc = InformixCdc('informix_1', timeout=10, max_records=256)
+    cdc = InformixCdc('informix_1', timeout=1, max_records=256)
 
     print 'connect()', cdc.connect('informix', 'informix')
     print 'is_connected', cdc.is_connected
     print 'session_id', cdc.session_id
     print 'enable()', cdc.enable("stocks:informix.cdc_test", "field1,field2")
+    print 'enable()', cdc.enable("stocks:informix.cdc_test2", "a,b")
     print 'activate()', cdc.activate()
 
-    while True:
-        i = 0
-        for record in cdc:
-            i += 1
-            if i % 10000 == 0:
-                break
-            print record.__repr__()
+    for record in cdc:
+        print record.__repr__()
 
 if __name__ == '__main__':
     main()

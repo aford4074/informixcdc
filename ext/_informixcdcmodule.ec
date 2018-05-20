@@ -4,9 +4,6 @@
 #include <Python.h>
 #include "structmember.h"
 
-#define BYTESHIFT 8
-#define BYTEMASK 0xFF
-
 #define DEFAULT_TIMEOUT 60
 #define DEFAULT_MAX_RECORDS 100
 #define DEFAULT_SYSCDCDB "syscdcv1"
@@ -14,12 +11,50 @@
 #define CONNSTRING_LEN 512
 #define LO_BYTES_PER_READ 65536
 #define DATABUFFER_SIZE LO_BYTES_PER_READ * 2
+#define MAX_CDC_TABS 64
+#define MAX_CDC_COLS 64
+#define MAX_SQL_STMT_LEN 8192
+
+#define PACKET_SCHEME 66
+
+#define HEADER_SZ_OFFSET 0
+#define PAYLOAD_SZ_OFFSET (HEADER_SZ_OFFSET + 4)
+#define PACKET_SCHEME_OFFSET (PAYLOAD_SZ_OFFSET + 4)
+#define RECORD_NUMBER_OFFSET (PACKET_SCHEME_OFFSET + 4)
+#define RECORD_HEADER_OFFSET (RECORD_NUMBER_OFFSET + 4)
+
+#define CDC_REC_BEGINTX            1
+#define CDC_REC_COMMTX             2
+#define CDC_REC_RBTX               3
+#define CDC_REC_INSERT            40
+#define CDC_REC_DELETE            41
+#define CDC_REC_UPDBEF            42
+#define CDC_REC_UPDAFT            43
+#define CDC_REC_DISCARD           62
+#define CDC_REC_TRUNCATE         119
+#define CDC_REC_TABSCHEM         200
+#define CDC_REC_TIMEOUT          201
+#define CDC_REC_ERROR            202
+
 EXEC SQL define TABLENAME_LEN 768;
 EXEC SQL define COLARG_LEN 1024;
 EXEC SQL define CDC_MAJ_VER 1;
 EXEC SQL define CDC_MIN_VER 1;
 EXEC SQL define FULLROWLOG_OFF 0;
 EXEC SQL define FULLROWLOG_ON 1;
+
+typedef struct {
+    int col_type;
+    int col_xid;
+    int col_size;
+    char *col_name;
+} column_t;
+
+typedef struct {
+    int num_cols;
+    int num_var_cols;
+    column_t column[MAX_CDC_COLS];
+} columns_t;
 
 static PyObject *ErrorObject;
 
@@ -36,7 +71,26 @@ typedef struct {
     char *next_record_start;
     int partial_record_bytes;
     int bytes_in_buffer;
+    int endianness;
+    int next_table_id;
+    columns_t tab_cols[MAX_CDC_TABS];
 } InformixCdcObject;
+
+static int2 ld2(const char *p);
+static int4 ld4(const char *p);
+static bigint ld8(const char *p);
+static double lddbl(const char *p, const int endianness);
+static float ldfloat(const char *p, const int endianness);
+static int get_platform_endianness(void);
+static char* fmt_utc_time(char *buf, time_t t);
+
+static void cdc_extract_header(char *record, int *header_sz, int *payload_sz,
+                               int *packet_scheme, int *record_number);
+static PyObject* cdc_extract_record(const char* record_start, int payload_sz,
+                                    int packet_scheme, int record_number);
+static int cdc_extract_tabschema(const char* rec, int payload_sz, PyObject *py_dict);
+static int cdc_extract_timeout(const char* rec, int payload_sz, PyObject *py_dict);
+static int cdc_add_tabschema(InformixCdcObject *self, const char* rec, int payload_sz);
 
 static PyTypeObject InformixCdc_Type;
 
@@ -81,6 +135,8 @@ InformixCdc_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         self->next_record_start = NULL;
         self->partial_record_bytes = 0;
         self->bytes_in_buffer = 0;
+        self->endianness = 0;
+        self->next_table_id = 0;
     }
 
     return (PyObject *)self;
@@ -136,6 +192,8 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     self->next_record_start = NULL;
     self->partial_record_bytes = 0;
     self->bytes_in_buffer = 0;
+    self->endianness = get_platform_endianness();
+    self->next_table_id = 0;
 
     return 0;
 }
@@ -313,14 +371,19 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     EXEC SQL BEGIN DECLARE SECTION;
     char *cdc_table = NULL;
     char *cdc_columns = NULL;
-    $integer session_id = self->session_id;
-    $integer table_id = 0;
-    $integer retval;
+    int session_id = self->session_id;
+    int table_id = self->next_table_id;
+    int retval;
     EXEC SQL END DECLARE SECTION;
 
     PyObject *retcode;
     PyObject *py_cdc_table = NULL;
     PyObject *py_cdc_columns = NULL;
+
+    if (table_id >= MAX_CDC_TABS) {
+        PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
+        return NULL;
+    }
 
     static char *kwlist[] = {"table", "columns", NULL };
 
@@ -363,6 +426,7 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         retcode = PyInt_FromLong(retval);
     }
     else {
+        self->next_table_id += 1;
         retcode = PyInt_FromLong(0L);
     }
 
@@ -391,52 +455,24 @@ InformixCdc_activate(InformixCdcObject *self)
         retcode = PyInt_FromLong(retval);
     }
     else {
-        retcode = PyInt_FromLong(0L);
+        retcode = PyInt_FromLong(0);
     }
 
     return retcode;
 }
 
 static PyObject *
-InformixCdc_iter(InformixCdcObject *self)
-{
-    Py_INCREF(self);
-    return (PyObject *)self;
-}
-
-static int4
-ld4 (char *p) {
-    int4    rtn =
-            ((((((((int4) p[0]
-        << BYTESHIFT) + (p[1] & BYTEMASK))
-        << BYTESHIFT) + (p[2] & BYTEMASK))
-        << BYTESHIFT) + (p[3] & BYTEMASK)));
-    return rtn;
-}
-
-static int
-cdc_extract_header(char *record, int *header_sz, int *payload_sz,
-                   int *packet_scheme, int *record_number) {
-    *header_sz = ld4(record);
-    *payload_sz = ld4(record + 4);
-    *packet_scheme = ld4(record + 8);
-    *record_number = ld4(record + 12);
-
-    return 1;
-}
-
-static PyObject *
-InformixCdc_iternext(InformixCdcObject *self)
+InformixCdc_fetchone(InformixCdcObject *self)
 {
     int bytes_read;
     mint lo_read_err = 0;
-    int rc;
     int4 header_sz;
     int4 payload_sz;
     int4 packet_scheme;
     int4 record_number;
     int4 record_sz;
-    PyObject *py_buffer = NULL;
+    PyObject *py_dict = NULL;
+    int rc;
 
     while (1) {
         /* if a partial record or we've got nothing in the buffer, */
@@ -457,6 +493,7 @@ InformixCdc_iternext(InformixCdcObject *self)
             }
 
             if (bytes_read <= 0 || lo_read_err < 0) {
+                PyErr_SetString(PyExc_IOError, "read from Informix CDC SBLOB failed");
                 return NULL;
             }
 
@@ -466,28 +503,34 @@ InformixCdc_iternext(InformixCdcObject *self)
 
         if (self->bytes_in_buffer >= 16) {
             // we have enough to extract the record size
-            rc = cdc_extract_header(self->next_record_start,
-                                    &header_sz,
-                                    &payload_sz,
-                                    &packet_scheme,
-                                    &record_number);
-
-            if (rc != 1) {
-                return NULL;
-            }
+            cdc_extract_header(self->next_record_start, &header_sz,
+                               &payload_sz, &packet_scheme, &record_number);
 
             record_sz = header_sz + payload_sz;
-            //printf("%d %d %d %d %d\n", header_sz, payload_sz, packet_scheme, record_number, record_sz);
             if (self->bytes_in_buffer >= record_sz) {
-                // we have enough to extract the record
-                py_buffer = PyString_FromStringAndSize(self->next_record_start,
-                                                       record_sz);
-                if (py_buffer == NULL) {
+                py_dict = cdc_extract_record(
+                    self->next_record_start + RECORD_HEADER_OFFSET,
+                    payload_sz, packet_scheme, record_number
+                );
+                if (py_dict == NULL) {
                     return NULL;
                 }
+
+                if (record_number == CDC_REC_TABSCHEM) {
+                    rc = cdc_add_tabschema(
+                        self, self->next_record_start + RECORD_HEADER_OFFSET,
+                        payload_sz
+                    );
+                    if (rc != 0) {
+                        PyErr_SetString(PyExc_IndexError,
+                                        "cannot add Informix CDC table scheme");
+                        return NULL;
+                    }
+                }
+
                 self->next_record_start += record_sz;
                 self->bytes_in_buffer -= record_sz;
-                return py_buffer;
+                return py_dict;
             }
             else {
                 self->partial_record_bytes = self->bytes_in_buffer;
@@ -497,6 +540,24 @@ InformixCdc_iternext(InformixCdcObject *self)
             self->partial_record_bytes = self->bytes_in_buffer;
         }
     }
+}
+
+static PyObject *
+InformixCdc_iter(InformixCdcObject *self)
+{
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static PyObject *
+InformixCdc_iternext(InformixCdcObject *self)
+{
+    PyObject *py_buffer = InformixCdc_fetchone(self);
+    if (py_buffer == NULL) {
+        return NULL;
+    }
+
+    return py_buffer;
 }
 
 static PyMethodDef InformixCdc_methods[] = {
@@ -748,4 +809,329 @@ init_informixcdc(void)
 
     Py_INCREF(&InformixCdc_Type);
     PyModule_AddObject(m, "InformixCdc", (PyObject *)&InformixCdc_Type);
+}
+
+#define BYTESHIFT 8
+#define BYTEMASK 0xFF
+#define IS_LITTLE_ENDIAN 0
+#define IS_BIG_ENDIAN 1
+
+static int2
+ld2 (const char *p)
+{
+    int2 rtn = (((
+        ((int2)p[0] << BYTESHIFT) +
+        (p[1] & BYTEMASK)) << BYTESHIFT));
+    return rtn;
+}
+
+static int4
+ld4 (const char *p)
+{
+    int4 rtn = ((((((
+        ((int4)p[0] << BYTESHIFT) +
+        (p[1] & BYTEMASK)) << BYTESHIFT) +
+        (p[2] & BYTEMASK)) << BYTESHIFT) +
+        (p[3] & BYTEMASK)));
+    return rtn;
+}
+
+static bigint
+ld8(const char *p)
+{
+    bigint rtn = ((((((((((((((
+        ((bigint)p[0] << BYTESHIFT) +
+        ((bigint)p[1] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[2] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[3] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[4] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[5] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[6] & BYTEMASK)) << BYTESHIFT) +
+        ((bigint)p[7] & BYTEMASK)));
+    return rtn;
+}
+
+static double
+lddbl(const char *p, const int endianness)
+{
+    double fval;
+
+    if (endianness == IS_LITTLE_ENDIAN) {
+        char *f;
+        int c;
+        f = (char *)&fval + sizeof(double) - 1;
+        c = sizeof(double);
+        do {
+            *f-- = *p++;
+        } while (--c);
+    }
+    else {
+        memcpy((char*)&fval, p, sizeof(double));
+    }
+
+    return(fval);
+}
+
+float
+ldfloat(const char *p, const int endianness)
+{
+    float fval;
+
+    if (endianness == IS_LITTLE_ENDIAN) {
+        char *f;
+        int c;
+        f = (char *)&fval + sizeof(float) - 1;
+        c = sizeof(float);
+        do {
+            *f-- = *p++;
+        } while (--c);
+    }
+    else {
+        memcpy((char*)&fval, p, sizeof(float));
+    }
+
+    return(fval);
+}
+
+static int
+get_platform_endianness()
+{
+    unsigned int i = 1;
+    char *c = (char*)&i;
+    if (*c) {
+        return IS_LITTLE_ENDIAN;
+    }
+    else {
+        return IS_BIG_ENDIAN;
+    }
+};
+
+static char *
+fmt_utc_time(char *buf, time_t t)
+{
+    struct tm *ltime = localtime(&t);
+
+    sprintf(buf, "%04u-%02u-%02u %02u:%02u:%02u",
+            (1900 + ltime->tm_year)%10000, ltime->tm_mon + 1, ltime->tm_mday,
+            ltime->tm_hour, ltime->tm_min, ltime->tm_sec);
+    return buf;
+}
+
+static void
+cdc_extract_header(char *record, int *header_sz, int *payload_sz,
+                   int *packet_scheme, int *record_number) {
+    *header_sz = ld4(record + HEADER_SZ_OFFSET);
+    *payload_sz = ld4(record + PAYLOAD_SZ_OFFSET);
+    *packet_scheme = ld4(record + PACKET_SCHEME_OFFSET);
+    *record_number = ld4(record + RECORD_NUMBER_OFFSET);
+}
+
+static PyObject*
+cdc_extract_record(const char* rec, int payload_sz,
+                   int packet_scheme, int record_number)
+{
+    char record_type[17];
+    PyObject *py_dict;
+    PyObject *py_record_type;
+    int rc = 0;
+
+    if (packet_scheme != PACKET_SCHEME) {
+        PyErr_SetString(PyExc_BufferError, "invalid Informix CDC packet scheme");
+        return NULL;
+    }
+
+    py_dict = PyDict_New();
+    if (py_dict == NULL) {
+        return NULL;
+    }
+
+    switch (record_number) {
+        case CDC_REC_BEGINTX:
+            strcpy(record_type, "CDC_REC_BEGINTX");
+            break;
+        case CDC_REC_COMMTX:
+            strcpy(record_type, "CDC_REC_COMMTX");
+            break;
+        case CDC_REC_RBTX:
+            strcpy(record_type, "CDC_REC_RBTX");
+            break;
+        case CDC_REC_INSERT:
+            strcpy(record_type, "CDC_REC_INSERT");
+            break;
+        case CDC_REC_DELETE:
+            strcpy(record_type, "CDC_REC_DELETE");
+            break;
+        case CDC_REC_UPDBEF:
+            strcpy(record_type, "CDC_REC_UPDBEF");
+            break;
+        case CDC_REC_UPDAFT:
+            strcpy(record_type, "CDC_REC_UPDAFT");
+            break;
+        case CDC_REC_DISCARD:
+            strcpy(record_type, "CDC_REC_DISCARD");
+            break;
+        case CDC_REC_TRUNCATE:
+            strcpy(record_type, "CDC_REC_TRUNCATE");
+            break;
+        case CDC_REC_TABSCHEM:
+            strcpy(record_type, "CDC_REC_TABSCHEM");
+            rc = cdc_extract_tabschema(rec, payload_sz, py_dict);
+            break;
+        case CDC_REC_TIMEOUT:
+            strcpy(record_type, "CDC_REC_TIMEOUT");
+            rc = cdc_extract_timeout(rec, payload_sz, py_dict);
+            break;
+        case CDC_REC_ERROR:
+            strcpy(record_type, "CDC_REC_ERROR");
+            break;
+        default:
+            strcpy(record_type, "CDC_REC_UNKNOWN");
+            rc = -1;
+    }
+
+    if (rc != 0) {
+        Py_DECREF(py_dict);
+        return NULL;
+    }
+
+    py_record_type = PyString_FromString(record_type);
+    if (py_record_type == NULL) {
+        return NULL;
+    }
+
+    PyDict_SetItemString(py_dict, "record_type", py_record_type);
+    Py_DECREF(py_record_type);
+
+    return py_dict;
+}
+
+static int
+cdc_extract_tabschema(const char *rec, int payload_sz, PyObject *py_dict)
+{
+    PyObject *py_tabid = NULL;
+    PyObject *py_flags = NULL;
+    PyObject *py_fix_len_sz = NULL;
+    PyObject *py_fix_len_cols = NULL;
+    PyObject *py_var_len_cols = NULL;
+    PyObject *py_cols_desc = NULL;
+
+    py_tabid = PyInt_FromLong(ld4(rec + 0));
+    if (py_tabid == NULL) {
+        return -1;
+    }
+
+    py_flags = PyInt_FromLong(ld4(rec + 4));
+    if (py_flags == NULL) {
+        return -1;
+    }
+
+    py_fix_len_sz = PyInt_FromLong(ld4(rec + 8));
+    if (py_fix_len_sz == NULL) {
+        return -1;
+    }
+
+    py_fix_len_cols = PyInt_FromLong(ld4(rec + 12));
+    if (py_fix_len_cols == NULL) {
+        return -1;
+    }
+
+    py_var_len_cols = PyInt_FromLong(ld4(rec + 16));
+    if (py_var_len_cols == NULL) {
+        return -1;
+    }
+
+    py_cols_desc = PyString_FromStringAndSize(rec + 20, payload_sz);
+    if (py_cols_desc == NULL) {
+        return -1;
+    }
+
+    PyDict_SetItemString(py_dict, "tabid", py_tabid);
+    Py_DECREF(py_tabid);
+    PyDict_SetItemString(py_dict, "flags", py_flags);
+    Py_DECREF(py_flags);
+    PyDict_SetItemString(py_dict, "fix_len_sz", py_fix_len_sz);
+    Py_DECREF(py_fix_len_sz);
+    PyDict_SetItemString(py_dict, "fix_len_cols", py_fix_len_cols);
+    Py_DECREF(py_fix_len_cols);
+    PyDict_SetItemString(py_dict, "var_len_cols", py_var_len_cols);
+    Py_DECREF(py_var_len_cols);
+    PyDict_SetItemString(py_dict, "cols_desc", py_cols_desc);
+    Py_DECREF(py_cols_desc);
+
+    return 0;
+}
+
+static int
+cdc_add_tabschema(InformixCdcObject *self, const char* rec, int payload_sz)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char sql[MAX_SQL_STMT_LEN];
+    EXEC SQL END DECLARE SECTION;
+
+    int tabid = ld4(rec + 0);
+    int var_len_cols = ld4(rec + 16);
+    ifx_sqlda_t *sqlda;
+    int col;
+    columns_t *columns;
+
+    if (tabid >= MAX_CDC_TABS) {
+        PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
+        return -1;
+    }
+
+    sprintf(sql, "create temp table t_informixcdc (%s) with no log",
+            rec + 20);
+
+    EXEC SQL EXECUTE IMMEDIATE :sql;
+
+    if (SQLCODE != 0) {
+        return -1;
+    }
+
+    EXEC SQL PREPARE informixcdc FROM "select * from t_informixcdc";
+
+    if (SQLCODE != 0) {
+        return -1;
+    }
+
+    EXEC SQL DESCRIBE informixcdc INTO sqlda;
+
+    if (SQLCODE != 0) {
+        return -1;
+    }
+
+    columns = &self->tab_cols[tabid];
+    for (col=0; col<sqlda->sqld; col++) {
+        columns->column[col].col_type = sqlda->sqlvar[col].sqltype;
+        columns->column[col].col_size =
+            rtypsize(sqlda->sqlvar[col].sqltype, sqlda->sqlvar[col].sqllen);
+        columns->column[col].col_xid = sqlda->sqlvar[col].sqlxid;
+        columns->column[col].col_name =
+            PyMem_Malloc(strlen(sqlda->sqlvar[col].sqlname)+1);
+        strcpy(columns->column[col].col_name, sqlda->sqlvar[col].sqlname);
+    }
+    columns->num_cols = col;
+    columns->num_var_cols = var_len_cols;
+
+    free(sqlda);
+
+    EXEC SQL EXECUTE IMMEDIATE "drop table t_informixcdc";
+
+    return 0;
+}
+
+static int
+cdc_extract_timeout(const char* rec, int payload_sz, PyObject *py_dict)
+{
+    PyObject *py_seq_number = NULL;
+
+    py_seq_number = PyInt_FromLong(ld8(rec + 0));
+    if (py_seq_number == NULL) {
+        return -1;
+    }
+
+    PyDict_SetItemString(py_dict, "seq_number", py_seq_number);
+    Py_DECREF(py_seq_number);
+
+    return 0;
 }
