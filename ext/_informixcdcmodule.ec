@@ -154,12 +154,13 @@ static void
 InformixCdc_dealloc(InformixCdcObject* self)
 {
     int tabid;
+    int col;
     Py_XDECREF(self->dbservername);
     Py_XDECREF(self->syscdcdb);
     PyMem_Free(self->lo_buffer);
 
     for (tabid=0; tabid < self->next_table_id; tabid++) {
-        for (int col=0; col < self->tab_cols[tabid].num_cols; col++) {
+        for (col=0; col < self->tab_cols[tabid].num_cols; col++) {
             PyMem_Free(self->tab_cols[tabid].column[col].col_name);
         }
     }
