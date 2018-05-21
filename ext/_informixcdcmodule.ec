@@ -253,7 +253,6 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
     ret = 0;
     assert(! PyErr_Occurred());
-    assert(ret == 0);
     goto finally;
 except:
     assert(PyErr_Occurred());
@@ -1212,19 +1211,19 @@ cdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict
     if (PyDict_SetItemString(py_dict, "tabid", py_tabid) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "flags", py_flags)) {
+    if (PyDict_SetItemString(py_dict, "flags", py_flags) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "fix_len_sz", py_fix_len_sz)) {
+    if (PyDict_SetItemString(py_dict, "fix_len_sz", py_fix_len_sz) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "fix_len_cols", py_fix_len_cols)) {
+    if (PyDict_SetItemString(py_dict, "fix_len_cols", py_fix_len_cols) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "var_len_cols", py_var_len_cols)) {
+    if (PyDict_SetItemString(py_dict, "var_len_cols", py_var_len_cols) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "cols_desc", py_cols_desc)) {
+    if (PyDict_SetItemString(py_dict, "cols_desc", py_cols_desc) != 0) {
         goto except;
     }
 
@@ -1292,19 +1291,19 @@ cdc_extract_iud(InformixCdcObject *self, int payload_sz, PyObject *py_dict)
         goto except;
     }
 
-    if (PyDict_SetItemString(py_dict, "seq_number", py_seq_number)) {
+    if (PyDict_SetItemString(py_dict, "seq_number", py_seq_number) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "transaction_id", py_transaction_id)) {
+    if (PyDict_SetItemString(py_dict, "transaction_id", py_transaction_id) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "tabid", py_tabid)) {
+    if (PyDict_SetItemString(py_dict, "tabid", py_tabid) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "flags", py_flags)) {
+    if (PyDict_SetItemString(py_dict, "flags", py_flags) != 0) {
         goto except;
     }
-    if (PyDict_SetItemString(py_dict, "columns", py_list)) {
+    if (PyDict_SetItemString(py_dict, "columns", py_list) != 0) {
         goto except;
     }
 
@@ -1393,6 +1392,12 @@ cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
     }
     columns->num_var_cols = var_len_cols;
 
+    EXEC SQL FREE informixcdc;
+
+    if (SQLCODE != 0) {
+        goto except;
+    }
+
     EXEC SQL EXECUTE IMMEDIATE "drop table t_informixcdc";
 
     // don't raise an error if we can't drop the temp table,
@@ -1411,8 +1416,8 @@ except:
     }
     ret = -1;
 finally:
-    return ret;
     free(sqlda);
+    return ret;
 }
 
 static int
@@ -1730,6 +1735,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                         PyErr_SetString(PyExc_ValueError, "cannot extract decimal");
                         goto except;
                     }
+                    ch_decimal[34] = '\0';
                     py_value = PyString_FromString(ch_decimal);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
@@ -1778,13 +1784,13 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             goto except;
         }
 
-        if (PyDict_SetItemString(py_dict, "name", py_name)) {
+        if (PyDict_SetItemString(py_dict, "name", py_name) != 0) {
             goto except;
         }
-        if (PyDict_SetItemString(py_dict, "value", py_value)) {
+        if (PyDict_SetItemString(py_dict, "value", py_value) != 0) {
             goto except;
         }
-        if (PyList_Append(py_list, py_dict)) {
+        if (PyList_Append(py_list, py_dict) != 0) {
             goto except;
         }
 
