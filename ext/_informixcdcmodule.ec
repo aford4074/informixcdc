@@ -2,7 +2,6 @@
 /* InformixCdc objects */
 
 #include <Python.h>
-#include "datetime.h"
 #include "structmember.h"
 
 /* From the InformixDB module:
@@ -10,10 +9,11 @@
  * included above because it comes first in the include path. We manually
  * include the Python one here (needs a few preprocessor tricks...)
  */
+#include "datetime.h"
 #define DATETIME_INCLUDE datetime.h
-#define HACKYDT_INC2(f) #f
-#define HACKYDT_INC(f) HACKYDT_INC2(f)
-#include HACKYDT_INC(PYTHON_INCLUDE/DATETIME_INCLUDE)
+#define PYDTINC2(f) #f
+#define PYDTINC1(f) PYDTINC2(f)
+#include PYDTINC1(PYTHON_INCLUDE/DATETIME_INCLUDE)
 
 EXEC SQL INCLUDE sqltypes;
 
@@ -22,8 +22,15 @@ EXEC SQL INCLUDE sqltypes;
 #define DEFAULT_SYSCDCDB "syscdcv1"
 #define CONNNAME_LEN 50
 #define CONNSTRING_LEN 512
+
+/*
+ * for reading the CDC SBLOB via ifx_lo_read()
+ * the buffer must be large enough to hold at least 1 full CDC record
+ * make this configurable at runtime in the future
+ */
 #define LO_BYTES_PER_READ 65536
-#define DATABUFFER_SIZE LO_BYTES_PER_READ * 2
+#define DATABUFFER_SIZE LO_BYTES_PER_READ * 2  // must be large enough to hold 1 record
+
 #define MAX_CDC_TABS 64
 #define MAX_CDC_COLS 64
 #define MAX_SQL_STMT_LEN 8192
@@ -110,7 +117,7 @@ typedef struct {
     PyObject *syscdcdb;
     char *lo_buffer;
     char *next_record_start;
-    int partial_record_bytes;
+    //int partial_record_bytes;
     int bytes_in_buffer;
     int endianness;
     int next_table_id;
@@ -188,7 +195,7 @@ InformixCdc_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     self->lo_buffer = NULL;
     self->next_record_start = NULL;
-    self->partial_record_bytes = 0;
+    //self->partial_record_bytes = 0;
     self->bytes_in_buffer = 0;
     self->endianness = 0;
     self->next_table_id = 0;
@@ -245,8 +252,8 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         }
     }
 
-    self->next_record_start = NULL;
-    self->partial_record_bytes = 0;
+    self->next_record_start = self->lo_buffer;
+    //self->partial_record_bytes = 0;
     self->bytes_in_buffer = 0;
     self->endianness = get_platform_endianness();
     self->next_table_id = 0;
@@ -559,13 +566,12 @@ InformixCdc_activate(InformixCdcObject *self)
     PyObject *ret = NULL;
     EXEC SQL BEGIN DECLARE SECTION;
     $integer session_id = self->session_id;
-    bigint lsn = 0;
+    bigint seq_number = 0;
     $integer retval = -1;
     EXEC SQL END DECLARE SECTION;
 
-
     EXEC SQL EXECUTE FUNCTION informix.cdc_activatesess(
-        :session_id, :lsn
+        :session_id, :seq_number
     ) INTO :retval;
 
     if (retval < 0) {
@@ -605,9 +611,76 @@ InformixCdc_fetchone(InformixCdcObject *self)
     int rc;
 
     while (1) {
-        /* if a partial record or we've got nothing in the buffer, */
-        /* we need to read from the SLOB */
-        /* if a partial record we need to copy the partial to the head of lo_buffer */
+        if (self->bytes_in_buffer >= 16) {
+            cdc_extract_header(self->next_record_start, &header_sz,
+                               &payload_sz, &packet_scheme, &record_number);
+
+            record_sz = header_sz + payload_sz;
+            if (self->bytes_in_buffer >= record_sz) {
+                py_dict = cdc_extract_record(self, payload_sz,
+                                             packet_scheme, record_number);
+                if (py_dict == NULL) {
+                    goto except;
+                }
+
+                if (record_number == CDC_REC_TABSCHEM) {
+                    rc = cdc_add_tabschema(self, payload_sz);
+                    if (rc != 0) {
+                        PyErr_SetString(PyExc_IndexError,
+                                        "cannot add Informix CDC table scheme");
+                        goto except;
+                    }
+                }
+
+                self->next_record_start += record_sz;
+                self->bytes_in_buffer -= record_sz;
+
+                // we've read and extracted a full record, break out of the loop
+                break;
+            }
+        }
+
+        // there isn't a full record in the buffer if we are here
+        memcpy(self->lo_buffer, self->next_record_start, self->bytes_in_buffer);
+        bytes_read = ifx_lo_read(self->session_id,
+                                 &self->lo_buffer[self->bytes_in_buffer],
+                                 LO_BYTES_PER_READ, &lo_read_err);
+        if (bytes_read <= 0 || lo_read_err < 0) {
+            PyErr_SetString(PyExc_IOError, "read from Informix CDC SBLOB failed");
+            goto except;
+        }
+        self->next_record_start = self->lo_buffer;
+        self->bytes_in_buffer += bytes_read;
+    }
+    assert(! PyErr_Occurred());
+    assert(py_dict);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_dict);
+    py_dict = NULL;
+finally:
+    return py_dict;
+}
+
+/*
+static PyObject *
+InformixCdc_fetchone_old(InformixCdcObject *self)
+{
+    PyObject *py_dict = NULL;
+    int bytes_read;
+    mint lo_read_err = 0;
+    int4 header_sz;
+    int4 payload_sz;
+    int4 packet_scheme;
+    int4 record_number;
+    int4 record_sz;
+    int rc;
+
+    while (1) {
+        // if a partial record or we've got nothing in the buffer,
+        // we need to read from the SLOB
+        // if a partial record we need to copy the partial to the head of lo_buffer
         if (self->partial_record_bytes > 0 || self->bytes_in_buffer == 0) {
             if (self->partial_record_bytes > 0) {
                 memcpy(self->lo_buffer, self->next_record_start, self->partial_record_bytes);
@@ -676,6 +749,8 @@ except:
 finally:
     return py_dict;
 }
+*/
+
 
 static PyObject *
 InformixCdc_iter(InformixCdcObject *self)
@@ -1376,7 +1451,7 @@ cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
         goto except;
     }
 
-    for (int col=0; col<sqlda->sqld; col++) {
+    for (int col=0; col < sqlda->sqld; col++) {
         columns->column[col].col_type = sqlda->sqlvar[col].sqltype;
         columns->column[col].col_size =
             rtypsize(sqlda->sqlvar[col].sqltype, sqlda->sqlvar[col].sqllen);
@@ -1410,7 +1485,7 @@ except:
     assert(PyErr_Occurred());
     if (tabid < MAX_CDC_TABS) {
         columns = &self->tab_cols[tabid];
-        for (int col=0; col<columns->num_cols; col++) {
+        for (int col=0; col < columns->num_cols; col++) {
             PyMem_Free(columns->column[col].col_name);
         }
     }
@@ -1496,7 +1571,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     }
 
     columns = &self->tab_cols[tabid];
-    varchar_len_arr = (rec + CHANGE_HEADER_SZ);
+    varchar_len_arr = rec + CHANGE_HEADER_SZ;
     col = varchar_len_arr + columns->num_var_cols * 4;
     for (int col_idx=0; col_idx < columns->num_cols; col_idx++) {
         py_dict = PyDict_New();
