@@ -2,7 +2,18 @@
 /* InformixCdc objects */
 
 #include <Python.h>
+#include "datetime.h"
 #include "structmember.h"
+
+/* From the InformixDB module:
+ * Python and Informix both have a datetime.h, the Informix header is
+ * included above because it comes first in the include path. We manually
+ * include the Python one here (needs a few preprocessor tricks...)
+ */
+#define DATETIME_INCLUDE datetime.h
+#define HACKYDT_INC2(f) #f
+#define HACKYDT_INC(f) HACKYDT_INC2(f)
+#include HACKYDT_INC(PYTHON_INCLUDE/DATETIME_INCLUDE)
 
 EXEC SQL INCLUDE sqltypes;
 
@@ -73,7 +84,8 @@ typedef struct {
     if (! default_##name) { \
         default_##name = value; \
         if (! default_##name) { \
-            PyErr_SetString(PyExc_RuntimeError, "Can not create default value for " #name); \
+            PyErr_SetString(PyExc_RuntimeError, \
+                            "Can not create default value for " #name); \
             return ret; \
         } \
     }
@@ -898,6 +910,8 @@ init_informixcdc(void)
 {
     PyObject *m;
 
+    PyDateTime_IMPORT;
+
     /* Due to cross platform compiler issues the slots must be filled
      * here. It's required for portability to Windows without requiring
      * C++. */
@@ -950,9 +964,7 @@ init_informixcdc(void)
 static int2
 ld2 (const char *p)
 {
-    int2 rtn = (((
-        ((int2)p[0] << BYTESHIFT) +
-        (p[1] & BYTEMASK)) << BYTESHIFT));
+    int2 rtn = (((p)[0] << BYTESHIFT) + ((p)[1] & BYTEMASK));
     return rtn;
 }
 
@@ -1437,6 +1449,7 @@ finally:
 #define BOOL_COL_LEN			2
 #define VARCHAR_LEN_OFFSET      1
 #define LVARCHAR_LEN_OFFSET     3
+#define ERRSTR_LEN              50
 
 static PyObject *
 cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
@@ -1458,8 +1471,10 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     columns_t *columns;
     bigint c_bigint;
     ifx_int8_t c_int8;
+    short mdy_date[3];
     int advance_col;
     int rc;
+    char err_str[ERRSTR_LEN];
     PyObject *py_list = NULL;
     PyObject *py_dict = NULL;
     PyObject *py_name = NULL;
@@ -1500,18 +1515,21 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 else {
                     rc = ifx_int8toasc(&c_int8, ch_int8, 20);
                     if (rc != 0) {
-                        PyErr_SetString(PyExc_OverflowError,
+                        PyErr_SetString(PyExc_ValueError,
                                         "cannot convert INT8 to ascii");
-                        py_value = NULL;
+                        goto except;
                     }
-                    else {
-                        py_value = PyLong_FromString(col, NULL, 10);
+                    py_value = PyLong_FromString(ch_int8, NULL, 10);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "INT8: PyLong_FromString failed: %s", ch_int8);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
                     }
                 }
                 break;
 
             case SQLSERIAL:
-            case SQLDATE:
             case SQLINT:
                 c_integer = ld4(col);
                 if (risnull(CINTTYPE, (char*)&c_integer)) {
@@ -1520,6 +1538,37 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyInt_FromLong(c_integer);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "INT: PyInt_FromLong failed: %d", c_integer);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
+                }
+                break;
+
+            case SQLDATE:
+                c_integer = ld4(col);
+                if (risnull(CINTTYPE, (char*)&c_integer)) {
+                    Py_INCREF(Py_None);
+                    py_value = Py_None;
+                }
+                else {
+                    rc = rjulmdy(c_integer, mdy_date);
+                    if (rc < 0) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "DATE: rjulmdy failed: %d", c_integer);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
+                    py_value = PyDate_FromDate(
+                        mdy_date[2], mdy_date[0], mdy_date[1]);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "DATE: PyDate_FromDate failed: %d", c_integer);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
@@ -1545,12 +1594,18 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyString_FromString(col);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "CHAR: PyString_FromString failed: %s", col);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
             case SQLNVCHAR:
             case SQLVCHAR:
-                varchar_len = ld4(&varchar_len_arr[varchar_len_arr_idx++]);
+                varchar_len = ld4(varchar_len_arr + 4 * varchar_len_arr_idx++);
                 col_len = varchar_len - VARCHAR_LEN_OFFSET;
                 col += VARCHAR_LEN_OFFSET;
                 if (risnull(CVCHARTYPE, col)) {
@@ -1559,13 +1614,20 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyString_FromStringAndSize(col, col_len);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "VARCHAR: PyString_FromStringAndSize failed: %d %s",
+                                 col_len, col);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 advance_col = 0;
                 col += col_len;
                 break;
 
             case SQLLVARCHAR:
-                varchar_len = ld4(&varchar_len_arr[varchar_len_arr_idx++]);
+                varchar_len = ld4(varchar_len_arr + 4 * varchar_len_arr_idx++);
                 col_len = varchar_len - LVARCHAR_LEN_OFFSET;
                 col += LVARCHAR_LEN_OFFSET;
                 if (risnull(CLVCHARTYPE, col)) {
@@ -1574,6 +1636,13 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyString_FromStringAndSize(col, col_len);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "LVARCHAR: PyString_FromStringAndSize failed: %d %s",
+                                 col_len, col);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 advance_col = 0;
                 col += col_len;
@@ -1587,6 +1656,12 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyLong_FromLong(c_bigint);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "BIGINT: PyLong_FromLong failed: %ld", c_bigint);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
@@ -1598,6 +1673,12 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyFloat_FromDouble(c_double);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "FLOAT: PyFloat_FromDouble failed: %lf", c_double);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
@@ -1609,6 +1690,12 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyFloat_FromDouble(c_float);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "SMFLOAT: PyFloat_FromDouble failed: %f", c_float);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
@@ -1620,6 +1707,12 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 }
                 else {
                     py_value = PyInt_FromLong(c_smallint);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "SMINT: PyInt_FromLong failed: %hd", c_smallint);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
+                    }
                 }
                 break;
 
@@ -1634,11 +1727,16 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     rc = dectoasc(&c_decimal, ch_decimal, 34,
                                   columns->column[col_idx].col_size);
                     if (rc != 0) {
-                        PyErr_SetString(PyExc_TypeError, "cannot extract decimal");
-                        py_value = NULL;
+                        PyErr_SetString(PyExc_ValueError, "cannot extract decimal");
+                        goto except;
                     }
-                    else {
-                        py_value = PyString_FromString(ch_decimal);
+                    py_value = PyString_FromString(ch_decimal);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "DECIMAL: PyString_FromString failed: %s",
+                                 ch_decimal);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
                     }
                 }
                 break;
@@ -1651,26 +1749,28 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     py_value = Py_None;
                 }
                 else {
-                    rc = dectoasc (&c_datetime.dt_dec, ch_decimal, 34,
-                                   columns->column[col_idx].col_size);
+                    rc = dectoasc(&c_datetime.dt_dec, ch_decimal, 34,
+                                  columns->column[col_idx].col_size);
                     if (rc != 0) {
-                        PyErr_SetString(PyExc_TypeError, "cannot extract datetime");
-                        py_value = NULL;
+                        PyErr_SetString(PyExc_ValueError, "cannot extract datetime");
+                        goto except;
                     }
-                    else {
-                        py_value = PyString_FromString(ch_decimal);
+                    ch_decimal[34] = '\0';
+                    py_value = PyString_FromString(ch_decimal);
+                    if (py_value == NULL) {
+                        snprintf(err_str, sizeof(err_str),
+                                 "DTIME: PyString_FromString failed: %s",
+                                 ch_decimal);
+                        PyErr_SetString(PyExc_ValueError, err_str);
+                        goto except;
                     }
                 }
                 break;
 
             default:
-                PyErr_SetString(PyExc_NotImplementedError, "unsupported data type");
-                py_value = NULL;
+                PyErr_SetString(PyExc_ValueError, "unsupported data type");
+                goto except;
                 break;
-        }
-
-        if (py_value == NULL) {
-            goto except;
         }
 
         py_name = PyString_FromString(columns->column[col_idx].col_name);
