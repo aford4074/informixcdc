@@ -1280,7 +1280,7 @@ cdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict
     if (py_var_len_cols == NULL) {
         goto except;
     }
-    py_cols_desc = PyString_FromStringAndSize(rec+20, payload_sz);
+    py_cols_desc = PyString_FromStringAndSize(rec+20, payload_sz-1);
     if (py_cols_desc == NULL) {
         goto except;
     }
@@ -1529,7 +1529,7 @@ finally:
 
 #define INT8_LO_OFFSET          2
 #define INT8_HI_OFFSET          6
-#define BOOL_COL_LEN			2
+#define BOOL_COL_LEN            2
 #define VARCHAR_LEN_OFFSET      1
 #define LVARCHAR_LEN_OFFSET     3
 #define ERRSTR_LEN              50
@@ -1603,6 +1603,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                                         "cannot convert INT8 to ascii");
                         goto except;
                     }
+                    ch_int8[sizeof(ch_int8)-1] = '\0';
                     py_value = PyLong_FromString(ch_int8, NULL, 10);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
@@ -1677,10 +1678,10 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     py_value = Py_None;
                 }
                 else {
-                    py_value = PyString_FromString(col);
+                    py_value = PyString_FromStringAndSize(col, columns->column[col_idx].col_size);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
-                                 "CHAR: PyString_FromString failed: %s", col);
+                                 "CHAR: PyString_FromStringAndSize failed");
                         PyErr_SetString(PyExc_ValueError, err_str);
                         goto except;
                     }
@@ -1700,8 +1701,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     py_value = PyString_FromStringAndSize(col, col_len);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
-                                 "VARCHAR: PyString_FromStringAndSize failed: %d %s",
-                                 col_len, col);
+                                 "VARCHAR: PyString_FromStringAndSize failed");
                         PyErr_SetString(PyExc_ValueError, err_str);
                         goto except;
                     }
@@ -1722,8 +1722,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     py_value = PyString_FromStringAndSize(col, col_len);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
-                                 "LVARCHAR: PyString_FromStringAndSize failed: %d %s",
-                                 col_len, col);
+                                 "LVARCHAR: PyString_FromStringAndSize failed");
                         PyErr_SetString(PyExc_ValueError, err_str);
                         goto except;
                     }
@@ -1814,7 +1813,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                         PyErr_SetString(PyExc_ValueError, "cannot extract decimal");
                         goto except;
                     }
-                    ch_decimal[34] = '\0';
+                    ch_decimal[sizeof(ch_decimal)-1] = '\0';
                     py_value = PyString_FromString(ch_decimal);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
@@ -1840,7 +1839,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                         PyErr_SetString(PyExc_ValueError, "cannot extract datetime");
                         goto except;
                     }
-                    ch_decimal[34] = '\0';
+                    ch_decimal[sizeof(ch_decimal)-1] = '\0';
                     py_value = PyString_FromString(ch_decimal);
                     if (py_value == NULL) {
                         snprintf(err_str, sizeof(err_str),
