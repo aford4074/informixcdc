@@ -153,11 +153,12 @@ static PyTypeObject InformixCdc_Type;
 static void
 InformixCdc_dealloc(InformixCdcObject* self)
 {
+    int tabid;
     Py_XDECREF(self->dbservername);
     Py_XDECREF(self->syscdcdb);
     PyMem_Free(self->lo_buffer);
 
-    for (int tabid=0; tabid < self->next_table_id; tabid++) {
+    for (tabid=0; tabid < self->next_table_id; tabid++) {
         for (int col=0; col < self->tab_cols[tabid].num_cols; col++) {
             PyMem_Free(self->tab_cols[tabid].column[col].col_name);
         }
@@ -1420,6 +1421,7 @@ cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
     int var_len_cols = ld4(rec + 16);
     ifx_sqlda_t *sqlda = NULL;
     columns_t *columns;
+    int col;
 
     if (tabid >= MAX_CDC_TABS) {
         PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
@@ -1451,7 +1453,7 @@ cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
         goto except;
     }
 
-    for (int col=0; col < sqlda->sqld; col++) {
+    for (col=0; col < sqlda->sqld; col++) {
         columns->column[col].col_type = sqlda->sqlvar[col].sqltype;
         columns->column[col].col_size =
             rtypsize(sqlda->sqlvar[col].sqltype, sqlda->sqlvar[col].sqllen);
@@ -1485,7 +1487,7 @@ except:
     assert(PyErr_Occurred());
     if (tabid < MAX_CDC_TABS) {
         columns = &self->tab_cols[tabid];
-        for (int col=0; col < columns->num_cols; col++) {
+        for (col=0; col < columns->num_cols; col++) {
             PyMem_Free(columns->column[col].col_name);
         }
     }
@@ -1554,6 +1556,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     short mdy_date[3];
     int advance_col;
     int rc;
+    int col_idx;
     char err_str[ERRSTR_LEN];
     PyObject *py_list = NULL;
     PyObject *py_dict = NULL;
@@ -1573,7 +1576,7 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     columns = &self->tab_cols[tabid];
     varchar_len_arr = rec + CHANGE_HEADER_SZ;
     col = varchar_len_arr + columns->num_var_cols * 4;
-    for (int col_idx=0; col_idx < columns->num_cols; col_idx++) {
+    for (col_idx=0; col_idx < columns->num_cols; col_idx++) {
         py_dict = PyDict_New();
         if (py_dict == NULL) {
             goto except;
