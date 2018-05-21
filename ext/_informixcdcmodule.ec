@@ -26,6 +26,10 @@ EXEC SQL INCLUDE sqltypes;
 #define RECORD_HEADER_OFFSET (RECORD_NUMBER_OFFSET + 4)
 #define CHANGE_HEADER_SZ 20
 
+/*
+ * Informix CDC Record types
+*/
+
 #define CDC_REC_BEGINTX            1
 #define CDC_REC_COMMTX             2
 #define CDC_REC_RBTX               3
@@ -46,6 +50,10 @@ EXEC SQL define CDC_MIN_VER 1;
 EXEC SQL define FULLROWLOG_OFF 0;
 EXEC SQL define FULLROWLOG_ON 1;
 
+/*
+ * Structs for maintaining copies of sqlda structs
+*/
+
 typedef struct {
     int col_type;
     int col_xid;
@@ -59,7 +67,25 @@ typedef struct {
     column_t column[MAX_CDC_COLS];
 } columns_t;
 
+#define PY_DEFAULT_ARGUMENT_INIT(name, value, ret) \
+    PyObject *name = NULL; \
+    static PyObject *default_##name = NULL; \
+    if (! default_##name) { \
+        default_##name = value; \
+        if (! default_##name) { \
+            PyErr_SetString(PyExc_RuntimeError, "Can not create default value for " #name); \
+            return ret; \
+        } \
+    }
+
+#define PY_DEFAULT_ARGUMENT_SET(name) if (! name) name = default_##name; \
+    Py_INCREF(name)
+
 static PyObject *ErrorObject;
+
+/*
+ * The InformixCdcObject
+*/
 
 typedef struct {
     PyObject_HEAD
@@ -79,6 +105,10 @@ typedef struct {
     columns_t tab_cols[MAX_CDC_TABS];
 } InformixCdcObject;
 
+/*
+ * Function prototypes for extracting data from CDC Records
+*/
+
 static int2 ld2(const char *p);
 static int4 ld4(const char *p);
 static bigint ld8(const char *p);
@@ -87,7 +117,7 @@ static float ldfloat(const char *p, const int endianness);
 static int get_platform_endianness(void);
 static char* fmt_utc_time(char *buf, time_t t);
 
-static void cdc_extract_header(char *record, int *header_sz, int *payload_sz,
+static void cdc_extract_header(const char *record, int *header_sz, int *payload_sz,
                                int *packet_scheme, int *record_number);
 static PyObject* cdc_extract_record(InformixCdcObject *self, int payload_sz,
                                     int packet_scheme, int record_number);
@@ -108,7 +138,6 @@ InformixCdc_dealloc(InformixCdcObject* self)
     Py_XDECREF(self->syscdcdb);
     PyMem_Free(self->lo_buffer);
 
-    // is this safe to do if next_table_id was artificially set to MAX_CDC_TABS?
     for (int tabid=0; tabid < self->next_table_id; tabid++) {
         for (int col=0; col < self->tab_cols[tabid].num_cols; col++) {
             PyMem_Free(self->tab_cols[tabid].column[col].col_name);
@@ -121,55 +150,68 @@ InformixCdc_dealloc(InformixCdcObject* self)
 static PyObject *
 InformixCdc_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 {
-    InformixCdcObject *self;
+    InformixCdcObject *self = NULL;
 
     self = (InformixCdcObject *)type->tp_alloc(type, 0);
-    if (self != NULL) {
-        self->name[0] = '\0';
-        self->is_connected = 0;
-        self->session_id = -1;
-
-        self->dbservername = PyString_FromString("");
-        if (self->dbservername == NULL) {
-            Py_DECREF(self);
-            return NULL;
-        }
-
-        self->timeout = -1;
-        self->max_records = -1;
-
-        self->syscdcdb = PyString_FromString("");
-        if (self->syscdcdb == NULL) {
-            Py_DECREF(self);
-            return NULL;
-        }
-
-        self->lo_buffer = NULL;
-        self->next_record_start = NULL;
-        self->partial_record_bytes = 0;
-        self->bytes_in_buffer = 0;
-        self->endianness = 0;
-        self->next_table_id = 0;
+    if (self == NULL) {
+        goto except;
     }
 
+    self->name[0] = '\0';
+    self->is_connected = 0;
+    self->session_id = -1;
+
+    self->dbservername = PyString_FromString("");
+    if (self->dbservername == NULL) {
+        goto except;
+    }
+
+    self->timeout = -1;
+    self->max_records = -1;
+
+    self->syscdcdb = PyString_FromString("");
+    if (self->syscdcdb == NULL) {
+        goto except;
+    }
+
+    self->lo_buffer = NULL;
+    self->next_record_start = NULL;
+    self->partial_record_bytes = 0;
+    self->bytes_in_buffer = 0;
+    self->endianness = 0;
+    self->next_table_id = 0;
+
+    assert(! PyErr_Occurred());
+    assert(self);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(self);
+    self = NULL;
+finally:
     return (PyObject *)self;
 }
 
 static int
 InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
+    int ret = -1;
     PyObject *dbservername = NULL;
-    PyObject *syscdcdb = NULL;
     PyObject *tmp;
+    PY_DEFAULT_ARGUMENT_INIT(syscdcdb, PyString_FromString(DEFAULT_SYSCDCDB), -1);
+    self->timeout = DEFAULT_TIMEOUT;
+    self->max_records = DEFAULT_MAX_RECORDS;
 
-    static char *kwlist[] = {"dbservername", "timeout", "max_records",
-                             "syscdcdb", NULL };
-
-    if (! PyArg_ParseTupleAndKeywords(args, kwds, "S|iiS:init", kwlist,
+    static const char *kwlist[] = { "dbservername", "timeout", "max_records",
+                                    "syscdcdb", NULL };
+    if (! PyArg_ParseTupleAndKeywords(args, kwds, "S|iiS:init",
+                                      (char**)(kwlist),
                                       &dbservername, &self->timeout,
                                       &self->max_records, &syscdcdb)) {
         return -1;
     }
+
+    PY_DEFAULT_ARGUMENT_SET(syscdcdb);
 
     sprintf(self->name, "cdc%p", self);
 
@@ -178,17 +220,6 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     self->dbservername = dbservername;
     Py_DECREF(tmp);
 
-    if (self->timeout <= 0) {
-        self->timeout = DEFAULT_TIMEOUT;
-    }
-
-    if (self->max_records <= 0) {
-        self->max_records = DEFAULT_MAX_RECORDS;
-    }
-
-    if (! syscdcdb) {
-        syscdcdb = PyString_FromString(DEFAULT_SYSCDCDB);
-    }
     tmp = self->syscdcdb;
     Py_INCREF(syscdcdb);
     self->syscdcdb = syscdcdb;
@@ -198,7 +229,7 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         self->lo_buffer = PyMem_Malloc(DATABUFFER_SIZE);
         if (! self->lo_buffer) {
             PyErr_SetString(PyExc_MemoryError, "cannot allocate lo_buffer");
-            return -1;
+            goto except;
         }
     }
 
@@ -208,7 +239,15 @@ InformixCdc_init(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     self->endianness = get_platform_endianness();
     self->next_table_id = 0;
 
-    return 0;
+    ret = 0;
+    assert(! PyErr_Occurred());
+    assert(ret == 0);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    ret = -1;
+finally:
+    return ret;
 }
 
 static PyMemberDef InformixCdc_members[] = {
@@ -248,26 +287,42 @@ static PyMemberDef InformixCdc_members[] = {
 static PyObject *
 InformixCdc_getis_connected(InformixCdcObject *self, void *closure)
 {
-    PyObject *is_connected;
+    PyObject *is_connected = NULL;
 
     is_connected = PyBool_FromLong(self->is_connected);
     if (is_connected == NULL) {
-        return NULL;
+        goto except;
     }
 
+    assert(! PyErr_Occurred());
+    assert(is_connected);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(is_connected);
+    is_connected = NULL;
+finally:
     return is_connected;
 }
 
 static PyObject *
 InformixCdc_getsession_id(InformixCdcObject *self, void *closure)
 {
-    PyObject *session_id;
+    PyObject *session_id = NULL;
 
     session_id = PyInt_FromLong(self->session_id);
     if (session_id == NULL) {
-        return NULL;
+        goto except;
     }
 
+    assert(! PyErr_Occurred());
+    assert(session_id);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(session_id);
+    session_id = NULL;
+finally:
     return session_id;
 }
 
@@ -294,93 +349,114 @@ static PyGetSetDef InformixCdc_getseters[] = {
 static PyObject *
 InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
+    PyObject *ret = NULL;
     EXEC SQL BEGIN DECLARE SECTION;
     char conn_string[CONNSTRING_LEN];
-    char* conn_dbservername = NULL;
+    char *conn_dbservername;
     char *conn_name = self->name;
-    char *conn_user = NULL;
-    char *conn_passwd = NULL;
+    char *conn_user;
+    char *conn_passwd;
     long timeout = self->timeout;
     long max_records = self->max_records;
     $integer session_id;
     EXEC SQL END DECLARE SECTION;
-
-    char* conn_syscdcdb = NULL;
-
-    PyObject *retcode;
-
+    const char* conn_syscdcdb;
     PyObject *py_conn_user = NULL;
     PyObject *py_conn_passwd = NULL;
 
-    static char *kwlist[] = {"user", "passwd", NULL };
-
-    if (! PyArg_ParseTupleAndKeywords(args, kwds, "|SS:connect", kwlist,
-                                      &py_conn_user, &py_conn_passwd)) {
+    static const char *kwlist[] = { "user", "passwd", NULL };
+    if (! PyArg_ParseTupleAndKeywords(args, kwds, "|SS:connect",
+                                      (char**)kwlist, &py_conn_user,
+                                      &py_conn_passwd)) {
         return NULL;
     }
 
-    if (py_conn_user && py_conn_user != Py_None) {
-        conn_user = PyString_AsString(py_conn_user);
-        if (conn_user == NULL ) {
-            return NULL;
-        }
+    if (py_conn_user == NULL) {
+        Py_INCREF(Py_None);
+        py_conn_user = Py_None;
     }
 
-    if (py_conn_passwd && py_conn_passwd != Py_None) {
-        conn_passwd = PyString_AsString(py_conn_passwd);
-        if (conn_passwd == NULL) {
-            return NULL;
-        }
+    if (py_conn_passwd == NULL) {
+        Py_INCREF(Py_None);
+        py_conn_passwd = Py_None;
     }
 
     conn_dbservername = PyString_AsString(self->dbservername);
     if (conn_dbservername == NULL) {
-        return NULL;
+        goto except;
     }
 
     conn_syscdcdb = PyString_AsString(self->syscdcdb);
     if (conn_syscdcdb == NULL) {
-        return NULL;
+        goto except;
     }
 
     sprintf(conn_string, "%s@%s", conn_syscdcdb, conn_dbservername);
 
-    if (conn_user && conn_passwd) {
+    if (py_conn_user != Py_None && py_conn_passwd != Py_None) {
+        conn_user = PyString_AsString(py_conn_user);
+        if (conn_user == NULL ) {
+            goto except;
+        }
+        conn_passwd = PyString_AsString(py_conn_passwd);
+        if (conn_passwd == NULL) {
+            goto except;
+        }
         EXEC SQL CONNECT TO :conn_string AS :conn_name USER :conn_user USING :conn_passwd;
     }
     else {
         EXEC SQL CONNECT TO :conn_string AS :conn_name;
     }
 
-    if (SQLCODE == 0) {
-        self->is_connected = 1;
+    if (SQLCODE != 0) {
+        ret = PyInt_FromLong(SQLCODE);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
-    else {
-        retcode = PyInt_FromLong(SQLCODE);
-        return retcode;
-    }
+
+    self->is_connected = 1;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_opensess(
         :conn_dbservername, 0, :timeout, :max_records, CDC_MAJ_VER, CDC_MIN_VER
     ) INTO :session_id;
 
     if (SQLCODE != 0) {
-        retcode = PyInt_FromLong(SQLCODE);
+        ret = PyInt_FromLong(SQLCODE);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
     else if (session_id < 0) {
-        retcode = PyInt_FromLong(session_id);
-    }
-    else {
-        self->session_id = session_id;
-        retcode = PyInt_FromLong(0L);
+        ret = PyInt_FromLong(session_id);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
 
-    return retcode;
+    self->session_id = session_id;
+
+    ret = PyInt_FromLong(0);
+    assert(! PyErr_Occurred());
+    assert(ret);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(ret);
+    ret = NULL;
+finally:
+    Py_DECREF(py_conn_user);
+    Py_DECREF(py_conn_passwd);
+    return ret;
 }
 
 static PyObject *
 InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
+    PyObject *ret = NULL;
     EXEC SQL BEGIN DECLARE SECTION;
     char *cdc_table = NULL;
     char *cdc_columns = NULL;
@@ -389,7 +465,6 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     int retval;
     EXEC SQL END DECLARE SECTION;
 
-    PyObject *retcode;
     PyObject *py_cdc_table = NULL;
     PyObject *py_cdc_columns = NULL;
 
@@ -398,21 +473,22 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    static char *kwlist[] = {"table", "columns", NULL };
+    static const char *kwlist[] = {"table", "columns", NULL };
 
-    if (! PyArg_ParseTupleAndKeywords(args, kwds, "SS:enable", kwlist,
-                                      &py_cdc_table, &py_cdc_columns)) {
+    if (! PyArg_ParseTupleAndKeywords(args, kwds, "SS:enable",
+                                      (char**)kwlist, &py_cdc_table,
+                                      &py_cdc_columns)) {
         return NULL;
     }
 
     cdc_table = PyString_AsString(py_cdc_table);
     if (cdc_table == NULL ) {
-        return NULL;
+        goto except;
     }
 
     cdc_columns = PyString_AsString(py_cdc_columns);
     if (cdc_columns == NULL) {
-        return NULL;
+        goto except;
     }
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_set_fullrowlogging(
@@ -420,12 +496,12 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     ) INTO :retval;
 
     if (SQLCODE != 0) {
-        retcode = PyInt_FromLong(SQLCODE);
-        return retcode;
+        ret = PyInt_FromLong(SQLCODE);
+        goto finally;
     }
     else if (retval < 0) {
-        retcode = PyInt_FromLong(retval);
-        return retcode;
+        ret = PyInt_FromLong(retval);
+        goto finally;
     }
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_startcapture(
@@ -433,50 +509,81 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     ) INTO :retval;
 
     if (SQLCODE != 0) {
-        retcode = PyInt_FromLong(SQLCODE);
+        ret = PyInt_FromLong(SQLCODE);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
     else if (retval < 0) {
-        retcode = PyInt_FromLong(retval);
-    }
-    else {
-        self->next_table_id += 1;
-        retcode = PyInt_FromLong(0L);
+        ret = PyInt_FromLong(retval);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
 
-    return retcode;
+    self->next_table_id += 1;
+    ret = PyInt_FromLong(0);
+    if (ret == NULL) {
+        goto except;
+    }
+    assert(! PyErr_Occurred());
+    assert(ret);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(ret);
+    ret = NULL;
+finally:
+    Py_DECREF(py_cdc_table);
+    Py_DECREF(py_cdc_columns);
+    return ret;
+
 }
 
 static PyObject *
 InformixCdc_activate(InformixCdcObject *self)
 {
+    PyObject *ret = NULL;
     EXEC SQL BEGIN DECLARE SECTION;
     $integer session_id = self->session_id;
     bigint lsn = 0;
-    $integer retval;
+    $integer retval = -1;
     EXEC SQL END DECLARE SECTION;
 
-    PyObject *retcode;
 
     EXEC SQL EXECUTE FUNCTION informix.cdc_activatesess(
         :session_id, :lsn
     ) INTO :retval;
 
-    if (SQLCODE != 0) {
-        retcode = PyInt_FromLong(SQLCODE);
-    }
-    else if (retval < 0) {
-        retcode = PyInt_FromLong(retval);
-    }
-    else {
-        retcode = PyInt_FromLong(0);
+    if (retval < 0) {
+        ret = PyInt_FromLong(retval);
+        if (ret == NULL) {
+            goto except;
+        }
+        goto finally;
     }
 
-    return retcode;
+    ret = PyInt_FromLong(SQLCODE);
+    if (ret == NULL) {
+        goto except;
+    }
+    assert(! PyErr_Occurred());
+    assert(ret);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(ret);
+    ret = NULL;
+finally:
+    return ret;
 }
 
 static PyObject *
 InformixCdc_fetchone(InformixCdcObject *self)
 {
+    PyObject *py_dict = NULL;
     int bytes_read;
     mint lo_read_err = 0;
     int4 header_sz;
@@ -484,7 +591,6 @@ InformixCdc_fetchone(InformixCdcObject *self)
     int4 packet_scheme;
     int4 record_number;
     int4 record_sz;
-    PyObject *py_dict = NULL;
     int rc;
 
     while (1) {
@@ -507,7 +613,7 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
             if (bytes_read <= 0 || lo_read_err < 0) {
                 PyErr_SetString(PyExc_IOError, "read from Informix CDC SBLOB failed");
-                return NULL;
+                goto except;
             }
 
             self->next_record_start = self->lo_buffer;
@@ -525,7 +631,7 @@ InformixCdc_fetchone(InformixCdcObject *self)
                     self, payload_sz, packet_scheme, record_number
                 );
                 if (py_dict == NULL) {
-                    return NULL;
+                    goto except;
                 }
 
                 if (record_number == CDC_REC_TABSCHEM) {
@@ -533,13 +639,13 @@ InformixCdc_fetchone(InformixCdcObject *self)
                     if (rc != 0) {
                         PyErr_SetString(PyExc_IndexError,
                                         "cannot add Informix CDC table scheme");
-                        return NULL;
+                        goto except;
                     }
                 }
 
                 self->next_record_start += record_sz;
                 self->bytes_in_buffer -= record_sz;
-                return py_dict;
+                break;
             }
             else {
                 self->partial_record_bytes = self->bytes_in_buffer;
@@ -549,6 +655,15 @@ InformixCdc_fetchone(InformixCdcObject *self)
             self->partial_record_bytes = self->bytes_in_buffer;
         }
     }
+    assert(! PyErr_Occurred());
+    assert(py_dict);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_dict);
+    py_dict = NULL;
+finally:
+    return py_dict;
 }
 
 static PyObject *
@@ -563,9 +678,16 @@ InformixCdc_iternext(InformixCdcObject *self)
 {
     PyObject *py_buffer = InformixCdc_fetchone(self);
     if (py_buffer == NULL) {
-        return NULL;
+        goto except;
     }
-
+    assert(! PyErr_Occurred());
+    assert(py_buffer);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_buffer);
+    py_buffer = NULL;
+finally:
     return py_buffer;
 }
 
@@ -927,12 +1049,12 @@ fmt_utc_time(char *buf, time_t t)
 }
 
 static void
-cdc_extract_header(char *record, int *header_sz, int *payload_sz,
+cdc_extract_header(const char *record, int *header_sz, int *payload_sz,
                    int *packet_scheme, int *record_number) {
-    *header_sz = ld4(record + HEADER_SZ_OFFSET);
-    *payload_sz = ld4(record + PAYLOAD_SZ_OFFSET);
-    *packet_scheme = ld4(record + PACKET_SCHEME_OFFSET);
-    *record_number = ld4(record + RECORD_NUMBER_OFFSET);
+    *header_sz = ld4((char*)record + HEADER_SZ_OFFSET);
+    *payload_sz = ld4((char*)record + PAYLOAD_SZ_OFFSET);
+    *packet_scheme = ld4((char*)record + PACKET_SCHEME_OFFSET);
+    *record_number = ld4((char*)record + RECORD_NUMBER_OFFSET);
 }
 
 static PyObject*
@@ -940,29 +1062,28 @@ cdc_extract_record(InformixCdcObject *self, int payload_sz,
                    int packet_scheme, int record_number)
 {
     char record_type[17];
-    PyObject *py_dict;
-    PyObject *py_record_type;
-    int rc = 0;
+    PyObject *py_dict = NULL;
+    PyObject *py_record_type = NULL;
+    int rc = -1;
 
     if (packet_scheme != PACKET_SCHEME) {
         PyErr_SetString(PyExc_BufferError, "invalid Informix CDC packet scheme");
-        return NULL;
+        goto except;
     }
 
     py_dict = PyDict_New();
     if (py_dict == NULL) {
-        return NULL;
+        goto except;
     }
 
     switch (record_number) {
         case CDC_REC_BEGINTX:
             strcpy(record_type, "CDC_REC_BEGINTX");
+            rc = 0;
             break;
         case CDC_REC_COMMTX:
             strcpy(record_type, "CDC_REC_COMMTX");
-            break;
-        case CDC_REC_RBTX:
-            strcpy(record_type, "CDC_REC_RBTX");
+            rc = 0;
             break;
         case CDC_REC_INSERT:
             strcpy(record_type, "CDC_REC_INSERT");
@@ -980,11 +1101,17 @@ cdc_extract_record(InformixCdcObject *self, int payload_sz,
             strcpy(record_type, "CDC_REC_UPDAFT");
             rc = cdc_extract_iud(self, payload_sz, py_dict);
             break;
+        case CDC_REC_RBTX:
+            strcpy(record_type, "CDC_REC_RBTX");
+            rc = 0;
+            break;
         case CDC_REC_DISCARD:
             strcpy(record_type, "CDC_REC_DISCARD");
+            rc = 0;
             break;
         case CDC_REC_TRUNCATE:
             strcpy(record_type, "CDC_REC_TRUNCATE");
+            rc = 0;
             break;
         case CDC_REC_TABSCHEM:
             strcpy(record_type, "CDC_REC_TABSCHEM");
@@ -996,31 +1123,47 @@ cdc_extract_record(InformixCdcObject *self, int payload_sz,
             break;
         case CDC_REC_ERROR:
             strcpy(record_type, "CDC_REC_ERROR");
+            rc = 0;
             break;
         default:
             strcpy(record_type, "CDC_REC_UNKNOWN");
-            rc = -1;
+            rc = 0;
     }
 
     if (rc != 0) {
-        Py_DECREF(py_dict);
-        return NULL;
+        if (! PyErr_Occurred()) {
+            PyErr_SetString(PyExc_RuntimeError, "error extracting CDC record");
+        }
+        goto except;
     }
 
     py_record_type = PyString_FromString(record_type);
     if (py_record_type == NULL) {
-        return NULL;
+        goto except;
     }
 
-    PyDict_SetItemString(py_dict, "record_type", py_record_type);
-    Py_DECREF(py_record_type);
+    if (PyDict_SetItemString(py_dict, "record_type", py_record_type) != 0) {
+        goto except;
+    };
 
+    assert(! PyErr_Occurred());
+    assert(py_record_type);
+    assert(py_dict);
+    Py_DECREF(py_record_type);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_dict);
+    Py_XDECREF(py_record_type);
+    py_dict = NULL;
+finally:
     return py_dict;
 }
 
 static int
 cdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict)
 {
+    int ret = -1;
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
     PyObject *py_tabid = NULL;
     PyObject *py_flags = NULL;
@@ -1031,119 +1174,174 @@ cdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict
 
     py_tabid = PyInt_FromLong(ld4(rec));
     if (py_tabid == NULL) {
-        return -1;
+        goto except;
     }
-
     py_flags = PyInt_FromLong(ld4(rec+4));
     if (py_flags == NULL) {
-        return -1;
+        goto except;
     }
-
     py_fix_len_sz = PyInt_FromLong(ld4(rec+8));
     if (py_fix_len_sz == NULL) {
-        return -1;
+        goto except;
     }
-
     py_fix_len_cols = PyInt_FromLong(ld4(rec+12));
     if (py_fix_len_cols == NULL) {
-        return -1;
+        goto except;
     }
-
     py_var_len_cols = PyInt_FromLong(ld4(rec+16));
     if (py_var_len_cols == NULL) {
-        return -1;
+        goto except;
     }
-
     py_cols_desc = PyString_FromStringAndSize(rec+20, payload_sz);
     if (py_cols_desc == NULL) {
-        return -1;
+        goto except;
     }
 
-    PyDict_SetItemString(py_dict, "tabid", py_tabid);
-    Py_DECREF(py_tabid);
-    PyDict_SetItemString(py_dict, "flags", py_flags);
-    Py_DECREF(py_flags);
-    PyDict_SetItemString(py_dict, "fix_len_sz", py_fix_len_sz);
-    Py_DECREF(py_fix_len_sz);
-    PyDict_SetItemString(py_dict, "fix_len_cols", py_fix_len_cols);
-    Py_DECREF(py_fix_len_cols);
-    PyDict_SetItemString(py_dict, "var_len_cols", py_var_len_cols);
-    Py_DECREF(py_var_len_cols);
-    PyDict_SetItemString(py_dict, "cols_desc", py_cols_desc);
-    Py_DECREF(py_cols_desc);
+    if (PyDict_SetItemString(py_dict, "tabid", py_tabid) != 0) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "flags", py_flags)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "fix_len_sz", py_fix_len_sz)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "fix_len_cols", py_fix_len_cols)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "var_len_cols", py_var_len_cols)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "cols_desc", py_cols_desc)) {
+        goto except;
+    }
 
-    return 0;
+    ret = 0;
+    assert(! PyErr_Occurred());
+    assert(py_tabid);
+    assert(py_flags);
+    assert(py_fix_len_sz);
+    assert(py_fix_len_cols);
+    assert(py_var_len_cols);
+    assert(py_cols_desc);
+    Py_DECREF(py_tabid);
+    Py_DECREF(py_flags);
+    Py_DECREF(py_fix_len_sz);
+    Py_DECREF(py_fix_len_cols);
+    Py_DECREF(py_var_len_cols);
+    Py_DECREF(py_cols_desc);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_tabid);
+    Py_XDECREF(py_flags);
+    Py_XDECREF(py_fix_len_sz);
+    Py_XDECREF(py_fix_len_cols);
+    Py_XDECREF(py_var_len_cols);
+    Py_XDECREF(py_cols_desc);
+    ret = -1;
+finally:
+    return ret;
 }
 
 static int
 cdc_extract_iud(InformixCdcObject *self, int payload_sz, PyObject *py_dict)
 {
+    int ret = -1;
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
     int tabid;
-    PyObject *py_seq_number;
-    PyObject *py_transaction_id;
-    PyObject *py_tabid;
-    PyObject *py_flags;
-    PyObject *py_list;
+    PyObject *py_seq_number = NULL;
+    PyObject *py_transaction_id = NULL;
+    PyObject *py_tabid = NULL;
+    PyObject *py_flags = NULL;
+    PyObject *py_list = NULL;
 
     py_seq_number = PyLong_FromLong(ld8(rec));
     if (py_seq_number == NULL) {
-        return -1;
+        goto except;
     }
-
     py_transaction_id = PyInt_FromLong(ld8(rec+8));
     if (py_transaction_id == NULL) {
-        return -1;
+        goto except;
     }
 
     tabid = ld4(rec+12);
     py_tabid = PyInt_FromLong(tabid);
     if (py_tabid == NULL) {
-        return -1;
+        goto except;
     }
 
     py_flags = PyInt_FromLong(ld4(rec+16));
     if (py_flags == NULL) {
-        return -1;
+        goto except;
     }
-
     py_list = cdc_extract_columns_to_list(self, tabid);
     if (py_list == NULL) {
-        return -1;
+        goto except;
     }
 
-    PyDict_SetItemString(py_dict, "seq_number", py_seq_number);
-    Py_DECREF(py_seq_number);
-    PyDict_SetItemString(py_dict, "transaction_id", py_transaction_id);
-    Py_DECREF(py_transaction_id);
-    PyDict_SetItemString(py_dict, "tabid", py_tabid);
-    Py_DECREF(py_tabid);
-    PyDict_SetItemString(py_dict, "flags", py_flags);
-    Py_DECREF(py_flags);
-    PyDict_SetItemString(py_dict, "columns", py_list);
-    Py_DECREF(py_list);
+    if (PyDict_SetItemString(py_dict, "seq_number", py_seq_number)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "transaction_id", py_transaction_id)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "tabid", py_tabid)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "flags", py_flags)) {
+        goto except;
+    }
+    if (PyDict_SetItemString(py_dict, "columns", py_list)) {
+        goto except;
+    }
 
-    return 0;
+    ret = 0;
+    assert(! PyErr_Occurred());
+    assert(py_seq_number);
+    assert(py_transaction_id);
+    assert(py_tabid);
+    assert(py_flags);
+    assert(py_list);
+    Py_DECREF(py_seq_number);
+    Py_DECREF(py_transaction_id);
+    Py_DECREF(py_tabid);
+    Py_DECREF(py_flags);
+    Py_DECREF(py_list);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_seq_number);
+    Py_XDECREF(py_transaction_id);
+    Py_XDECREF(py_tabid);
+    Py_XDECREF(py_flags);
+    Py_XDECREF(py_list);
+    ret = -1;
+finally:
+    return ret;
 }
 
 static int
 cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
 {
+    int ret = -1;
     EXEC SQL BEGIN DECLARE SECTION;
     char sql[MAX_SQL_STMT_LEN];
     EXEC SQL END DECLARE SECTION;
 
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
-    int tabid = ld4(rec + 0);
+    int tabid = ld4(rec);
     int var_len_cols = ld4(rec + 16);
-    ifx_sqlda_t *sqlda;
-    int col;
+    ifx_sqlda_t *sqlda = NULL;
     columns_t *columns;
 
     if (tabid >= MAX_CDC_TABS) {
         PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
-        return -1;
+        goto except;
     }
+
+    columns = &self->tab_cols[tabid];
+    columns->num_cols = 0;
 
     sprintf(sql, "create temp table t_informixcdc (%s) with no log",
             rec+20);
@@ -1152,59 +1350,86 @@ cdc_add_tabschema(InformixCdcObject *self, int payload_sz)
 
     if (SQLCODE != 0) {
         PyErr_SetString(PyExc_Exception, "cannot create CDC temp table");
-        return -1;
+        goto except;
     }
 
     EXEC SQL PREPARE informixcdc FROM "select * from t_informixcdc";
 
     if (SQLCODE != 0) {
-        return -1;
+        goto except;
     }
 
     EXEC SQL DESCRIBE informixcdc INTO sqlda;
 
     if (SQLCODE != 0) {
-        return -1;
+        goto except;
     }
 
-    columns = &self->tab_cols[tabid];
-    for (col=0; col<sqlda->sqld; col++) {
+    for (int col=0; col<sqlda->sqld; col++) {
         columns->column[col].col_type = sqlda->sqlvar[col].sqltype;
         columns->column[col].col_size =
             rtypsize(sqlda->sqlvar[col].sqltype, sqlda->sqlvar[col].sqllen);
         columns->column[col].col_xid = sqlda->sqlvar[col].sqlxid;
         columns->column[col].col_name =
             PyMem_Malloc(strlen(sqlda->sqlvar[col].sqlname)+1);
+        if (! columns->column[col].col_name) {
+            PyErr_SetString(PyExc_MemoryError, "cannot allocate column name");
+            goto except;
+        }
         strcpy(columns->column[col].col_name, sqlda->sqlvar[col].sqlname);
+        columns->num_cols++;
     }
-    columns->num_cols = col;
     columns->num_var_cols = var_len_cols;
-
-    free(sqlda);
 
     EXEC SQL EXECUTE IMMEDIATE "drop table t_informixcdc";
 
     // don't raise an error if we can't drop the temp table,
     // the next attempt to add a table will fail with error
 
-    return 0;
+    ret = 0;
+    assert(! PyErr_Occurred());
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    if (tabid < MAX_CDC_TABS) {
+        columns = &self->tab_cols[tabid];
+        for (int col=0; col<columns->num_cols; col++) {
+            PyMem_Free(columns->column[col].col_name);
+        }
+    }
+    ret = -1;
+finally:
+    return ret;
+    free(sqlda);
 }
 
 static int
 cdc_extract_timeout(InformixCdcObject *self, int payload_sz, PyObject *py_dict)
 {
+    int ret = -1;
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
     PyObject *py_seq_number = NULL;
 
     py_seq_number = PyLong_FromLong(ld8(rec));
     if (py_seq_number == NULL) {
-        return -1;
+        goto except;
     }
 
-    PyDict_SetItemString(py_dict, "seq_number", py_seq_number);
-    Py_DECREF(py_seq_number);
+    if (PyDict_SetItemString(py_dict, "seq_number", py_seq_number) != 0) {
+        goto except;
+    }
 
-    return 0;
+    ret = 0;
+    assert(! PyErr_Occurred());
+    assert(py_seq_number);
+    Py_DECREF(py_seq_number);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_seq_number);
+    ret = -1;
+finally:
+    return ret;
 }
 
 #define INT8_LO_OFFSET          2
@@ -1235,19 +1460,19 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     ifx_int8_t c_int8;
     int advance_col;
     int rc;
-    PyObject *py_list;
-    PyObject *py_dict;
-    PyObject *py_name;
-    PyObject *py_value;
+    PyObject *py_list = NULL;
+    PyObject *py_dict = NULL;
+    PyObject *py_name = NULL;
+    PyObject *py_value = NULL;
 
     if (tabid >= self->next_table_id) {
         PyErr_SetString(PyExc_IndexError, "invalid internel CDC table id");
-        return NULL;
+        goto except;
     }
 
     py_list = PyList_New(0);
     if (py_list == NULL) {
-        return NULL;
+        goto except;
     }
 
     columns = &self->tab_cols[tabid];
@@ -1256,13 +1481,10 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
     for (int col_idx=0; col_idx < columns->num_cols; col_idx++) {
         py_dict = PyDict_New();
         if (py_dict == NULL) {
-            Py_DECREF(py_list);
-            return NULL;
+            goto except;
         }
 
         advance_col = 1;
-
-        /*  Process the data type of the column */
         switch (MASKNONULL(columns->column[col_idx].col_type)) {
             case SQLINT8:
             case SQLSERIAL8:
@@ -1272,8 +1494,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 c_int8.data[1] = ld4(col+INT8_HI_OFFSET);
 
                 if (risnull(CINT8TYPE, (char*)&c_int8)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     rc = ifx_int8toasc(&c_int8, ch_int8, 20);
@@ -1293,8 +1515,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLINT:
                 c_integer = ld4(col);
                 if (risnull(CINTTYPE, (char*)&c_integer)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyInt_FromLong(c_integer);
@@ -1318,8 +1540,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
 
             case SQLCHAR:
                 if (risnull(CCHARTYPE, col)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyString_FromString(col);
@@ -1332,8 +1554,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 col_len = varchar_len - VARCHAR_LEN_OFFSET;
                 col += VARCHAR_LEN_OFFSET;
                 if (risnull(CVCHARTYPE, col)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyString_FromStringAndSize(col, col_len);
@@ -1347,8 +1569,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                 col_len = varchar_len - LVARCHAR_LEN_OFFSET;
                 col += LVARCHAR_LEN_OFFSET;
                 if (risnull(CLVCHARTYPE, col)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyString_FromStringAndSize(col, col_len);
@@ -1360,8 +1582,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLINFXBIGINT:
                 c_bigint = ld8(col);
                 if (risnull(CBIGINTTYPE, (char*)&c_bigint)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyLong_FromLong(c_bigint);
@@ -1371,8 +1593,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLFLOAT :
                 c_double = lddbl(col, self->endianness);
                 if (risnull(CDOUBLETYPE, (char*)&c_double)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyFloat_FromDouble(c_double);
@@ -1382,8 +1604,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLSMFLOAT:
                 c_float = ldfloat(col, self->endianness);
                 if (risnull(CFLOATTYPE, (char*)&c_float)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyFloat_FromDouble(c_float);
@@ -1393,8 +1615,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLSMINT:
                 c_smallint = ld2(col);
                 if (risnull(CSHORTTYPE, (char*)&c_smallint)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     py_value = PyInt_FromLong(c_smallint);
@@ -1405,8 +1627,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLDECIMAL:
                 lddecimal(col, columns->column[col_idx].col_size, &c_decimal);
                 if (risnull(CDECIMALTYPE, (char*)&c_decimal)) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     rc = dectoasc(&c_decimal, ch_decimal, 34,
@@ -1425,8 +1647,8 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
             case SQLINTERVAL:
                 lddecimal(col, columns->column[col_idx].col_size, &(c_datetime.dt_dec));
                 if (risnull(CDTIMETYPE, (char*)&(c_datetime.dt_dec))) {
+                    Py_INCREF(Py_None);
                     py_value = Py_None;
-                    Py_INCREF(py_value);
                 }
                 else {
                     rc = dectoasc (&c_datetime.dt_dec, ch_decimal, 34,
@@ -1448,30 +1670,45 @@ cdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
         }
 
         if (py_value == NULL) {
-            Py_DECREF(py_dict);
-            Py_DECREF(py_list);
-            return NULL;
+            goto except;
         }
 
         py_name = PyString_FromString(columns->column[col_idx].col_name);
         if (py_name == NULL) {
-            Py_DECREF(py_value);
-            Py_DECREF(py_dict);
-            Py_DECREF(py_list);
-            return NULL;
+            goto except;
         }
 
-        PyDict_SetItemString(py_dict, "name", py_name);
-        Py_DECREF(py_name);
-        PyDict_SetItemString(py_dict, "value", py_value);
-        Py_DECREF(py_value);
-        PyList_Append(py_list, py_dict);
-        Py_DECREF(py_dict);
+        if (PyDict_SetItemString(py_dict, "name", py_name)) {
+            goto except;
+        }
+        if (PyDict_SetItemString(py_dict, "value", py_value)) {
+            goto except;
+        }
+        if (PyList_Append(py_list, py_dict)) {
+            goto except;
+        }
 
         if (advance_col) {
             col += columns->column[col_idx].col_size;
         }
     }
 
+    assert(! PyErr_Occurred());
+    assert(py_name);
+    assert(py_value);
+    assert(py_dict);
+    assert(py_list);
+    Py_DECREF(py_name);
+    Py_DECREF(py_value);
+    Py_DECREF(py_dict);
+    goto finally;
+except:
+    assert(PyErr_Occurred());
+    Py_XDECREF(py_name);
+    Py_XDECREF(py_value);
+    Py_XDECREF(py_dict);
+    Py_XDECREF(py_list);
+    py_list = NULL;
+finally:
     return py_list;
 }
