@@ -9,7 +9,7 @@ class InformixCdc(_InformixCdc):
 
 def main():
     import pprint
-    cdc = InformixCdc('informix_1', timeout=5, max_records=2)
+    cdc = InformixCdc('informix_1', timeout=1, max_records=2, lo_read_sz=32)
 
     print 'connect()', cdc.connect('informix', 'informix')
     print 'is_connected', cdc.is_connected
@@ -23,7 +23,7 @@ def main():
                                  "cdc_integer_low, cdc_integer_high, cdc_smallfloat_low,"
                                  "cdc_smallfloat_high, cdc_smallint_low, cdc_smallint_high,"
                                  "cdc_varchar, cdc_lvarchar")
-    print 'activate()', cdc.activate()
+    print 'activate()', cdc.activate(seq_number=0)
 
     pp = pprint.PrettyPrinter(indent=4)
     try:
