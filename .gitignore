@@ -19,6 +19,7 @@ lib
 lib64
 ext/esqlver.h
 ext/_informixcdcmodule.c
+ext/example.ec
 *.swp
 
 # Installer logs
