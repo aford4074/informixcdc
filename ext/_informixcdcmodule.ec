@@ -654,7 +654,7 @@ InformixCdc_extract_columns_to_list(InformixCdcObject *self, int tabid)
                     strncpy(ch_hour,  ch_decimal+8,   2); ch_hour[2]  = '\0';
                     strncpy(ch_min,   ch_decimal+10,  2); ch_min[2]   = '\0';
                     strncpy(ch_sec,   ch_decimal+12,  2); ch_sec[2]   = '\0';
-                    strncpy(ch_usec,  ch_decimal+15, 10); ch_sec[10]  = '\0';
+                    strncpy(ch_usec,  ch_decimal+15, 10); ch_usec[10]  = '\0';
                     py_value = PyDateTime_FromDateAndTime(strtol(ch_year,  &end, 10),
                                                           strtol(ch_month, &end, 10),
                                                           strtol(ch_day,   &end, 10),
