@@ -24,17 +24,7 @@ EXEC SQL INCLUDE sqltypes;
 #define CONNSTRING_LEN 512
 #define ERRSTR_LEN 50
 
-/*
- * for reading the CDC SBLOB via ifx_lo_read()
- * the buffer must be large enough to hold at least 1 full CDC record
- * make this configurable at runtime in the future
- */
-/*
-#define LO_BYTES_PER_READ 65536
-#define DATABUFFER_SIZE LO_BYTES_PER_READ * 2  // must be large enough to hold 1 record
-*/
 #define MIN_LO_BUFFER_SZ 65536
-
 #define MAX_CDC_TABS 64
 #define MAX_CDC_COLS 64
 #define MAX_SQL_STMT_LEN 8192
@@ -138,19 +128,6 @@ static bigint ld8(const char *p);
 static double lddbl(const char *p, const int endianness);
 static float ldfloat(const char *p, const int endianness);
 static int get_platform_endianness(void);
-/*
-static char* fmt_utc_time(char *buf, time_t t);
-
-static void InformixCdc_extract_header(const char *record, int *header_sz, int *payload_sz,
-                               int *packet_scheme, int *record_number);
-static PyObject* InformixCdc_extract_record(InformixCdcObject *self, int payload_sz,
-                                    int packet_scheme, int record_number);
-static int InformixCdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict);
-static int InformixCdc_extract_timeout(InformixCdcObject *self, int payload_sz, PyObject *py_dict);
-static int InformixCdc_add_tabschema(InformixCdcObject *self, int payload_sz);
-static int InformixCdc_extract_iud(InformixCdcObject *self, int payload_sz, PyObject *py_dict);
-static PyObject *InformixCdc_extract_columns_to_list(InformixCdcObject *self, int tabid);
-*/
 
 static PyTypeObject InformixCdc_Type;
 
@@ -354,6 +331,7 @@ static PyGetSetDef InformixCdc_getseters[] = {
 /*
  * private helper functions that do all of the heavy lifting
  */
+
 #define INT8_LO_OFFSET          2
 #define INT8_HI_OFFSET          6
 #define BOOL_COL_LEN            2
@@ -946,6 +924,7 @@ InformixCdc_add_tabschema(InformixCdcObject *self, int payload_sz)
         goto except;
     }
 
+    // can't find the header that defines rtypsize
     for (col=0; col < sqlda->sqld; col++) {
         columns->column[col].col_type = sqlda->sqlvar[col].sqltype;
         columns->column[col].col_size =
@@ -961,6 +940,8 @@ InformixCdc_add_tabschema(InformixCdcObject *self, int payload_sz)
         columns->num_cols++;
     }
     columns->num_var_cols = var_len_cols;
+
+    free(sqlda);
 
     EXEC SQL FREE informixcdc;
 
@@ -986,7 +967,6 @@ except:
     }
     ret = -1;
 finally:
-    free(sqlda);
     return ret;
 }
 
@@ -1222,7 +1202,6 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
 
     static const char *kwlist[] = {"table", "columns", NULL };
-
     if (! PyArg_ParseTupleAndKeywords(args, kwds, "ss:enable",
                                       (char**)kwlist, &cdc_table,
                                       &cdc_columns)) {
@@ -1761,16 +1740,3 @@ get_platform_endianness()
         return IS_BIG_ENDIAN;
     }
 };
-
-/* get rid of this
-static char *
-fmt_utc_time(char *buf, time_t t)
-{
-    struct tm *ltime = localtime(&t);
-
-    sprintf(buf, "%04u-%02u-%02u %02u:%02u:%02u",
-            (1900 + ltime->tm_year)%10000, ltime->tm_mon + 1, ltime->tm_mday,
-            ltime->tm_hour, ltime->tm_min, ltime->tm_sec);
-    return buf;
-}
-*/
