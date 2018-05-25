@@ -2244,7 +2244,8 @@ InformixCdc_fetchone(InformixCdcObject *self)
         if (self->bytes_in_buffer > 0) {
             memcpy(self->lo_buffer, self->next_record_start, self->bytes_in_buffer);
         }
-        bytes_read = fake_ifx_lo_read(self->session_id,
+        //bytes_read = fake_ifx_lo_read(self->session_id,
+        bytes_read = ifx_lo_read(self->session_id,
                                  &self->lo_buffer[self->bytes_in_buffer],
                                  self->lo_read_sz, &lo_read_err);
         if (bytes_read <= 0 || lo_read_err < 0) {

@@ -1,4 +1,4 @@
-import sys, traceback
+import sys, traceback, time
 
 from _informixcdc import *
 
@@ -9,13 +9,12 @@ class InformixCdc(_InformixCdc):
 
 def main():
     import pprint
-    cdc = InformixCdc('informix_1', timeout=1, max_records=2, lo_buffer_sz=128)
+    cdc = InformixCdc('informix_1', timeout=1, max_records=20,
+                      lo_buffer_sz=1000, use_savepoints=False)
 
     print 'connect()', cdc.connect('informix', 'informix')
     print 'is_connected', cdc.is_connected
     print 'session_id', cdc.session_id
-    #print 'enable()', cdc.enable("stocks:informix.cdc_test", "field1,field2")
-    #print 'enable()', cdc.enable("stocks:informix.cdc_test2", "a,b")
     print 'enable()', cdc.enable(database="informixcdc_test",
                                  owner="informix",
                                  table="informixcdc_test",
@@ -25,12 +24,20 @@ def main():
                                  "cdc_integer_low, cdc_integer_high, cdc_smallfloat_low,"
                                  "cdc_smallfloat_high, cdc_smallint_low, cdc_smallint_high,"
                                  "cdc_varchar, cdc_lvarchar")
-    print 'activate()', cdc.activate(seq_number=0)
+    print 'activate()', cdc.activate(seq_number=287784092040)
 
     pp = pprint.PrettyPrinter(indent=4)
+
+    counter = 0
     try:
         for record in cdc:
-            pp.pprint(record)
+            counter += 1
+            if counter % 10000 == 0:
+                print counter
+                pp.pprint(record)
+
+        if counter % 10000 != 0:
+            print counter
     except:
         print '-'*60
         traceback.print_exc(file=sys.stdout)
