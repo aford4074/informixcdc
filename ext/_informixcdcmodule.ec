@@ -1083,10 +1083,9 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
     char *col;
     char *varchar_len_arr;
     int varchar_len_arr_idx = 0;
-    table_t *table;
+    const table_t *table;
     int advance_col;
-    int col_idx;
-    char err_str[ERRSTR_LEN+1];
+    Py_ssize_t col_idx;
     PyObject *py_list = NULL;
     PyObject *py_dict = NULL;
 
@@ -1095,23 +1094,27 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
         goto except;
     }
 
-    py_list = PyList_New(0);
+    table = &self->tables[tabid];
+    varchar_len_arr = rec + CHANGE_HEADER_SZ;
+    col = varchar_len_arr + table->num_var_cols * 4;
+
+    py_list = PyList_New(table->num_cols);
     if (py_list == NULL) {
         goto except;
     }
-
-    table = (InformixCdcObject *)&self->tables[tabid];
-    varchar_len_arr = rec + CHANGE_HEADER_SZ;
-    col = varchar_len_arr + table->num_var_cols * 4;
+    // there is a memory leak in this loop...somewhere
     for (col_idx=0; col_idx < table->num_cols; col_idx++) {
         py_dict =
             InformixCdc_extract_column_to_dict(self, table, col, col_idx,
                                                varchar_len_arr,
                                                &varchar_len_arr_idx,
                                                &advance_col);
-        if (PyList_Append(py_list, py_dict) != 0) {
+        if (py_dict == NULL) {
             goto except;
         }
+        PyList_SET_ITEM(py_list, col_idx, py_dict);
+        Py_DECREF(py_dict);
+
         if (advance_col) {
             col += table->columns[col_idx].col_size;
         }
@@ -1121,7 +1124,6 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
     goto finally;
 except:
     assert(PyErr_Occurred());
-    Py_XDECREF(py_dict);
     Py_XDECREF(py_list);
     py_list = NULL;
 finally:
@@ -2241,7 +2243,6 @@ InformixCdc_fetchone(InformixCdcObject *self)
             PyErr_SetString(PyExc_IOError, "read from Informix CDC SBLOB failed");
             goto except;
         }
-        printf("read: %d, in buffer: %d\n", bytes_read, self->bytes_in_buffer);
         self->next_record_start = self->lo_buffer;
         self->bytes_in_buffer += bytes_read;
     }
