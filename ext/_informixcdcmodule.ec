@@ -416,11 +416,9 @@ InformixCdc_PyString_FromTabid(const InformixCdcObject *self, const int tabid)
 
     assert(! PyErr_Occurred());
     assert(py_string);
-    Py_DECREF(py_string);
     goto finally;
 except:
     assert(PyErr_Occurred());
-    Py_XDECREF(py_string);
     py_string = NULL;
 finally:
     return py_string;
@@ -729,8 +727,8 @@ InformixCdc_extract_header(const char *record, int *header_sz, int *payload_sz,
 
 static PyObject *
 InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
-                                   const table_t *table, const char* col,
-                                   const int col_idx, const char* varchar_len_arr,
+                                   const column_t *column, const char* col,
+                                   const char* varchar_len_arr,
                                    int *varchar_len_arr_idx, int *advance_col)
 {
     char ch_int8[21];
@@ -757,8 +755,9 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
         goto except;
     }
 
-    *advance_col = 1;
-    switch (MASKNONULL(table->columns[col_idx].col_type)) {
+    // there is a memory leak in here...somewhere
+    *advance_col = 0;
+    switch (MASKNONULL(column->col_type)) {
         case SQLINT8:
         case SQLSERIAL8:
             // IS THIS THE RIGHT WAY?
@@ -842,8 +841,8 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 py_value = *(col+1) ? Py_True : Py_False;
             }
             Py_INCREF(py_value);
-            *advance_col = 0;
-            col += BOOL_COL_LEN;
+            *advance_col = 1;
+            //col += BOOL_COL_LEN;
             break;
 
         case SQLCHAR:
@@ -852,7 +851,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 Py_INCREF(py_value);
             }
             else {
-                py_value = PyString_FromStringAndSize(col, table->columns[col_idx].col_size);
+                py_value = PyString_FromStringAndSize(col, column->col_size);
                 if (py_value == NULL) {
                     snprintf(err_str, sizeof(err_str),
                              "CHAR: PyString_FromStringAndSize failed");
@@ -880,8 +879,8 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                     goto except;
                 }
             }
-            *advance_col = 0;
-            col += col_len;
+            *advance_col = col_len;
+            //col += col_len;
             break;
 
         case SQLLVARCHAR:
@@ -901,8 +900,8 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                     goto except;
                 }
             }
-            *advance_col = 0;
-            col += col_len;
+            *advance_col = col_len;
+            //col += col_len;
             break;
 
         case SQLINFXBIGINT:
@@ -973,17 +972,20 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             }
             break;
 
+        /* this causes a mem leak */
         case SQLMONEY:
         case SQLDECIMAL:
+            py_value = PyString_FromString("1.2");
+            break;
             // I can't find the header file that contains lddecimal
-            lddecimal(col, table->columns[col_idx].col_size, &c_decimal);
+            lddecimal(col, column->col_size, &c_decimal);
             if (risnull(CDECIMALTYPE, (char*)&c_decimal)) {
                 py_value = Py_None;
                 Py_INCREF(py_value);
             }
             else {
-                rc = dectoasc(&c_decimal, ch_decimal, 34,
-                              table->columns[col_idx].col_size);
+                rc = dectoasc(&c_decimal, ch_decimal, sizeof(ch_decimal)-1,
+                              column->col_size);
                 if (rc != 0) {
                     PyErr_SetString(PyExc_ValueError, "cannot extract decimal");
                     goto except;
@@ -1002,7 +1004,9 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
 
         case SQLDTIME:
         case SQLINTERVAL:
-            lddecimal(col, table->columns[col_idx].col_size, &(c_datetime.dt_dec));
+            py_value = PyString_FromString("1.2");
+            break;
+            lddecimal(col, column->col_size, &(c_datetime.dt_dec));
             if (risnull(CDTIMETYPE, (char*)&(c_datetime.dt_dec))) {
                 py_value = Py_None;
                 Py_INCREF(py_value);
@@ -1012,7 +1016,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 char ch_hour[3], ch_min[3], ch_sec[3], ch_usec[11];
                 char *end;
                 rc = dectoasc(&c_datetime.dt_dec, ch_decimal, 34,
-                              table->columns[col_idx].col_size);
+                              column->col_size);
                 if (rc != 0) {
                     PyErr_SetString(PyExc_ValueError, "cannot extract datetime");
                     goto except;
@@ -1043,12 +1047,13 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             break;
 
         default:
+            break; //teest
             PyErr_SetString(PyExc_ValueError, "unsupported data type");
             goto except;
             break;
     }
 
-    py_name = PyString_FromString(table->columns[col_idx].col_name);
+    py_name = PyString_FromString(column->col_name);
     if (py_name == NULL) {
         goto except;
     }
@@ -1084,8 +1089,9 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
     char *varchar_len_arr;
     int varchar_len_arr_idx = 0;
     const table_t *table;
+    const column_t *column;
     int advance_col;
-    Py_ssize_t col_idx;
+    int col_idx;
     PyObject *py_list = NULL;
     PyObject *py_dict = NULL;
 
@@ -1102,10 +1108,10 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
     if (py_list == NULL) {
         goto except;
     }
-    // there is a memory leak in this loop...somewhere
     for (col_idx=0; col_idx < table->num_cols; col_idx++) {
+        column = &table->columns[col_idx];
         py_dict =
-            InformixCdc_extract_column_to_dict(self, table, col, col_idx,
+            InformixCdc_extract_column_to_dict(self, column, col,
                                                varchar_len_arr,
                                                &varchar_len_arr_idx,
                                                &advance_col);
@@ -1113,10 +1119,12 @@ InformixCdc_extract_columns_to_list(const InformixCdcObject *self, int tabid)
             goto except;
         }
         PyList_SET_ITEM(py_list, col_idx, py_dict);
-        Py_DECREF(py_dict);
 
-        if (advance_col) {
+        if (advance_col == 0) {
             col += table->columns[col_idx].col_size;
+        }
+        else {
+            col += advance_col;
         }
     }
     assert(! PyErr_Occurred());
