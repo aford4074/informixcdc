@@ -32,7 +32,8 @@ nosetests.xml
 test.ksh
 godb.ksh
 .env
-ifx_lo_read.in
+tests/data/ifx_lo_read.in
+build.ksh
 
 # Translations
 *.mo

@@ -177,11 +177,14 @@ static int
 mock_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
 {
     static FILE* f = NULL;
+    char infile[200] = "./tests/data/ifx_lo_read.in";
     int ret = 0;
 
     if (f == NULL) {
-        f = fopen("ifx_lo_read.in", "rb");
-        if (f == NULL) { printf("cantopen\b"); }
+        f = fopen(infile, "rb");
+        if (f == NULL) {
+            printf("can't open mock ifx_lo_read file: %s\n", infile);
+            return -1; }
     }
 
     *err = 0;
@@ -191,6 +194,22 @@ mock_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
         ret = fread(buf, 1, read_sz, f);
     }
     return ret;
+}
+
+static int
+write_testing_sblob(char *buf, int sz)
+{
+    static FILE* f = NULL;
+    char outfile[200] = "./tests/data/ifx_lo_read.in";
+
+    if (f == NULL) {
+        f = fopen(outfile, "wb");
+        if (f == NULL) {
+            printf("can't open mock ifx_lo_read file: %s\n", outfile);
+            return -1; }
+    }
+
+    return fwrite(buf, 1, sz, f);
 }
 
 static void
@@ -2179,6 +2198,9 @@ static PyObject *
 InformixCdc_fetchone(InformixCdcObject *self)
 {
     int bytes_read;
+#ifdef OWRITESBLOB
+    int bytes_written;
+#endif OWRITESBLOB
     mint lo_read_err = 0;
     int4 header_sz;
     int4 payload_sz;
@@ -2283,7 +2305,6 @@ InformixCdc_fetchone(InformixCdcObject *self)
                    self->next_record_start,
                    self->bytes_in_buffer);
         }
-        // TODO: make this a compile time flag with #define
         bytes_read = IFX_LO_READ(self->session_id,
                                  &self->lo_buffer[self->bytes_in_buffer],
                                  self->lo_read_sz, &lo_read_err);
@@ -2292,6 +2313,15 @@ InformixCdc_fetchone(InformixCdcObject *self)
                             "read from Informix CDC SBLOB failed");
             goto except;
         }
+#ifdef OWRITESBLOB
+        bytes_written =
+            write_testing_sblob(&self->lo_buffer[self->bytes_in_buffer],
+                                bytes_read);
+        if (bytes_written != bytes_read) {
+            PyErr_SetString(PyExc_IOError,
+                            "cannot write testing SBLOB");
+        }
+#endif
         self->next_record_start = self->lo_buffer;
         self->bytes_in_buffer += bytes_read;
     }

@@ -32,11 +32,11 @@ def main():
     try:
         for record in cdc:
             counter += 1
-            if counter % 10000 == 0:
+            if counter % 100 == 0:
                 print counter
                 pp.pprint(record)
 
-        if counter % 10000 != 0:
+        if counter % 100 != 0:
             print counter
     except:
         print '-'*60

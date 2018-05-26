@@ -21,6 +21,8 @@ class build_ext(_build_ext):
     user_options = _build_ext.user_options + [
         ('testing', None,
         'testing mode'),
+        ('overwrite-sblob', None,
+        'Enable recreate testing SBLOB from new capture.'),
         ('esql-threadlib=', None,
         '[ESQL/C] Thread library to use with ESQL/C'),
         ('esql-informixdir=', None,
@@ -29,7 +31,7 @@ class build_ext(_build_ext):
         '[ESQL/C] statically link against ESQL/C libraries')
         ]
 
-    boolean_options = [ 'esql-static', 'testing' ]
+    boolean_options = [ 'esql-static', 'testing', 'overwrite-sblob' ]
 
     def initialize_options(self):
         _build_ext.initialize_options(self)
@@ -38,6 +40,7 @@ class build_ext(_build_ext):
         self.esql_threadlib = None
         self.esql_static = 0 # link dynamically by default
         self.testing = 0
+        self.overwrite_sblob = 0;
         self.esql_parts = []
         self.undef_macros = []
 
@@ -171,7 +174,10 @@ See the README for build requirements.
 
         if self.testing:
             ext.undef_macros.append('NDEBUG')
-            
+
+        if self.overwrite_sblob:
+            ext.define_macros.append(('OWRITESBLOB', None))
+
         _build_ext.build_extension(self, ext)
 
 class bdist_wininst(_bdist_wininst):
