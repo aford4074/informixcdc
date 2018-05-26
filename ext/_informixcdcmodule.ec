@@ -184,7 +184,9 @@ mock_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
         f = fopen(infile, "rb");
         if (f == NULL) {
             printf("can't open mock ifx_lo_read file: %s\n", infile);
-            return -1; }
+            return -1;
+        }
+        printf("using mock_ifx_lo_read");
     }
 
     *err = 0;
@@ -196,6 +198,7 @@ mock_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
     return ret;
 }
 
+#ifdef OWRITESBLOB
 static int
 write_testing_sblob(char *buf, int sz)
 {
@@ -211,6 +214,7 @@ write_testing_sblob(char *buf, int sz)
 
     return fwrite(buf, 1, sz, f);
 }
+#endif
 
 static void
 InformixCdc_dealloc(InformixCdcObject* self)
@@ -1017,11 +1021,24 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             }
             break;
 
-        /* this causes a mem leak */
+        /*
+         * lddecimal most likely causes a memory leak, probably because it
+         * is defined in Python and ESQL/C and we're calling the Python
+         * verion.
+         */
         case SQLMONEY:
         case SQLDECIMAL:
-            py_value = PyString_FromString("1.2");
+            // disable decimals
+            py_value = PyString_FromString("0.0");
+            if (py_value == NULL) {
+                snprintf(err_str, sizeof(err_str),
+                         "DECIMAL: PyString_FromString failed: %s",
+                         ch_decimal);
+                PyErr_SetString(PyExc_ValueError, err_str);
+                goto except;
+            }
             break;
+
             // I can't find the header file that contains lddecimal
             lddecimal(col, column->col_size, &c_decimal);
             if (risnull(CDECIMALTYPE, (char*)&c_decimal)) {
@@ -1048,10 +1065,24 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             }
             break;
 
+        /*
+         * lddecimal most likely causes a memory leak, probably because it
+         * is defined in Python and ESQL/C and we're calling the Python
+         * verion.
+         */
         case SQLDTIME:
         case SQLINTERVAL:
-            py_value = PyString_FromString("1.2");
+            // disable decimals
+            py_value = PyString_FromString("0.0");
+            if (py_value == NULL) {
+                snprintf(err_str, sizeof(err_str),
+                         "DECIMAL: PyString_FromString failed: %s",
+                         ch_decimal);
+                PyErr_SetString(PyExc_ValueError, err_str);
+                goto except;
+            }
             break;
+            
             lddecimal(col, column->col_size, &(c_datetime.dt_dec));
             if (risnull(CDTIMETYPE, (char*)&(c_datetime.dt_dec))) {
                 py_value = Py_None;
@@ -2200,7 +2231,7 @@ InformixCdc_fetchone(InformixCdcObject *self)
     int bytes_read;
 #ifdef OWRITESBLOB
     int bytes_written;
-#endif OWRITESBLOB
+#endif
     mint lo_read_err = 0;
     int4 header_sz;
     int4 payload_sz;
