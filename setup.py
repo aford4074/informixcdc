@@ -19,6 +19,10 @@ class build_ext(_build_ext):
     """ build_ext which can handle ESQL/C (*.ec) files """
 
     user_options = _build_ext.user_options + [
+        ('testing', None,
+        'testing mode'),
+        ('overwrite-sblob', None,
+        'Enable recreate testing SBLOB from new capture.'),
         ('esql-threadlib=', None,
         '[ESQL/C] Thread library to use with ESQL/C'),
         ('esql-informixdir=', None,
@@ -27,7 +31,7 @@ class build_ext(_build_ext):
         '[ESQL/C] statically link against ESQL/C libraries')
         ]
 
-    boolean_options = [ 'esql-static' ]
+    boolean_options = [ 'esql-static', 'testing', 'overwrite-sblob' ]
 
     def initialize_options(self):
         _build_ext.initialize_options(self)
@@ -35,7 +39,10 @@ class build_ext(_build_ext):
         self.esql_informixdir = None
         self.esql_threadlib = None
         self.esql_static = 0 # link dynamically by default
+        self.testing = 0
+        self.overwrite_sblob = 0;
         self.esql_parts = []
+        self.undef_macros = []
 
     def finalize_options(self):
         _build_ext.finalize_options(self)
@@ -63,6 +70,9 @@ class build_ext(_build_ext):
 
         if self.esql_static:
             self.esql_parts.append('-static')
+
+        if self.testing:
+            self.undef_macros.append('NDEBUG')
 
         # determine esql version
         driver_name = "INFORMIX-ESQL"
@@ -162,6 +172,12 @@ See the README for build requirements.
 
                 ext.sources[ext.sources.index(file)] = file[:-3]+'.c'
 
+        if self.testing:
+            ext.undef_macros.append('NDEBUG')
+
+        if self.overwrite_sblob:
+            ext.define_macros.append(('OWRITESBLOB', None))
+
         _build_ext.build_extension(self, ext)
 
 class bdist_wininst(_bdist_wininst):
@@ -186,7 +202,7 @@ if get_platform().startswith('aix-'):
 module1 = Extension('_informixcdc',
                     sources = [os.path.join('ext','_informixcdcmodule.ec')],
                     include_dirs = ['ext'],
-                    define_macros = extra_macros )
+                    define_macros = extra_macros, )
 
 # patch distutils if it can't cope with the "classifiers" or
 # "download_url" keywords

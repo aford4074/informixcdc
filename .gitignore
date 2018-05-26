@@ -29,6 +29,11 @@ pip-log.txt
 .coverage
 .tox
 nosetests.xml
+test.ksh
+godb.ksh
+.env
+tests/data/ifx_lo_read.in
+build.ksh
 
 # Translations
 *.mo
