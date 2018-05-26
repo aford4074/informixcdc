@@ -1,5 +1,27 @@
 
-/* InformixCdc objects */
+/* Informix Change Data Capture - Andrew Ford 2018
+ *
+ * Modern versions of Informix include the ability to subscribe to events
+ * like row insert, update, delete via the Change Data Capture API.
+ *
+ * The API is a stream of binary data encoded with events and event data and
+ * therefore it isn't really accessible. Not everyone is going to sit down
+ * and write an ESQL/C or Java application to decode a stream of bytes and
+ * parse out the data within.
+ *
+ * That's where this module comes in. My hope is that this Python
+ * implementation will let more people take advantage of this nice feature,
+ * and I had never written a Python C extension before and wondered what it
+ * was all about after being completely mystified by the InformixDB Python
+ * module that I've used for many years.
+ *
+ * Anywhoozles, I hope you enjoy this and I hope to get the DECIMAL
+ * memory leak figured out. Oh, I bet it has something to do with Python
+ * having a lddecimal function and ESQL/C having an lddecimal function and
+ * one is getting used when I'm expecting the other to be used.
+ *
+ */
+
 
 #include <Python.h>
 #include "structmember.h"
@@ -103,6 +125,10 @@ typedef struct {
 #define PY_DEFAULT_ARGUMENT_SET(name) if (! name) name = default_##name; \
     Py_INCREF(name)
 
+/*
+ * InformixCdc objects
+ */
+
 static PyObject *ErrorObject;
 
 /*
@@ -148,7 +174,7 @@ static PyTypeObject InformixCdc_Type;
 #define InformixCdcObject_Check(v)      (Py_TYPE(v) == &InformixCdc_Type)
 
 static int
-fake_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
+mock_ifx_lo_read(bigint sess, char *buf, int read_sz, int *err)
 {
     static FILE* f = NULL;
     int ret = 0;
@@ -319,7 +345,7 @@ static PyMemberDef InformixCdc_members[] = {
         T_STRING,
         offsetof(InformixCdcObject, dbservername),
         READONLY,
-        PyDoc_STR("dbservername of Informix instance to capture CDC"),
+        PyDoc_STR("dbservername of Informix perform CDC against"),
     },
     {
         "timeout",
@@ -333,7 +359,7 @@ static PyMemberDef InformixCdc_members[] = {
         T_INT,
         offsetof(InformixCdcObject, max_records),
         READONLY,
-        PyDoc_STR("max records CDC can return in one event message"),
+        PyDoc_STR("max records CDC API can return in one event message"),
     },
     {
         "syscdcdb",
@@ -347,7 +373,7 @@ static PyMemberDef InformixCdc_members[] = {
         T_INT,
         offsetof(InformixCdcObject, session_id),
         READONLY,
-        PyDoc_STR("session id returned by Informix for CDC"),
+        PyDoc_STR("session id returned by Informix for CDC API"),
     },
     {
         NULL
@@ -522,6 +548,12 @@ static char* informixcdc_dbconn = NULL;
 #define InformixCdc_th_set_dbconn(s) (informixcdc_dbconn = (s))
 
 #endif // IFXDB_MT
+
+#ifdef NDEBUG
+#define IFX_LO_READ ifx_lo_read
+#else
+#define IFX_LO_READ mock_ifx_lo_read
+#endif
 
 static bigint
 InformixCdc_query_restart_seq_number(const InformixCdcObject *self)
@@ -831,9 +863,6 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             break;
 
         case SQLBOOL:
-            /* boolean stream has 2 bytes, first byte indicate nullness
-             * second byte indicate 1 (true) or 0 (false)
-            */
             if (*col == 1) {
                 py_value = Py_None;
             }
@@ -841,8 +870,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 py_value = *(col+1) ? Py_True : Py_False;
             }
             Py_INCREF(py_value);
-            *advance_col = 1;
-            //col += BOOL_COL_LEN;
+            *advance_col = BOOL_COL_LEN;
             break;
 
         case SQLCHAR:
@@ -879,8 +907,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                     goto except;
                 }
             }
-            *advance_col = col_len;
-            //col += col_len;
+            *advance_col = VARCHAR_LEN_OFFSET + col_len;
             break;
 
         case SQLLVARCHAR:
@@ -900,8 +927,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                     goto except;
                 }
             }
-            *advance_col = col_len;
-            //col += col_len;
+            *advance_col = LVARCHAR_LEN_OFFSET + col_len;
             break;
 
         case SQLINFXBIGINT:
@@ -987,7 +1013,8 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 rc = dectoasc(&c_decimal, ch_decimal, sizeof(ch_decimal)-1,
                               column->col_size);
                 if (rc != 0) {
-                    PyErr_SetString(PyExc_ValueError, "cannot extract decimal");
+                    PyErr_SetString(PyExc_ValueError,
+                                    "cannot extract decimal");
                     goto except;
                 }
                 ch_decimal[sizeof(ch_decimal)-1] = '\0';
@@ -1018,7 +1045,8 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 rc = dectoasc(&c_datetime.dt_dec, ch_decimal, 34,
                               column->col_size);
                 if (rc != 0) {
-                    PyErr_SetString(PyExc_ValueError, "cannot extract datetime");
+                    PyErr_SetString(PyExc_ValueError,
+                                    "cannot extract datetime");
                     goto except;
                 }
                 ch_decimal[sizeof(ch_decimal)-1] = '\0';
@@ -1029,13 +1057,14 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 strncpy(ch_min,   ch_decimal+10,  2); ch_min[2]   = '\0';
                 strncpy(ch_sec,   ch_decimal+12,  2); ch_sec[2]   = '\0';
                 strncpy(ch_usec,  ch_decimal+15, 10); ch_usec[10]  = '\0';
-                py_value = PyDateTime_FromDateAndTime(strtol(ch_year,  &end, 10),
-                                                      strtol(ch_month, &end, 10),
-                                                      strtol(ch_day,   &end, 10),
-                                                      strtol(ch_hour,  &end, 10),
-                                                      strtol(ch_min,   &end, 10),
-                                                      strtol(ch_sec,   &end, 10),
-                                                      strtol(ch_usec,  &end, 10));
+                py_value = PyDateTime_FromDateAndTime(
+                                strtol(ch_year,  &end, 10),
+                                strtol(ch_month, &end, 10),
+                                strtol(ch_day,   &end, 10),
+                                strtol(ch_hour,  &end, 10),
+                                strtol(ch_min,   &end, 10),
+                                strtol(ch_sec,   &end, 10),
+                                strtol(ch_usec,  &end, 10));
                 if (py_value == NULL) {
                     snprintf(err_str, sizeof(err_str),
                              "DTIME: PyDateTime_FromDateAndTime failed: %s",
@@ -1225,7 +1254,8 @@ finally:
 }
 
 static int
-InformixCdc_extract_tabschema(InformixCdcObject *self, int payload_sz, PyObject *py_dict)
+InformixCdc_extract_tabschema(InformixCdcObject *self, int payload_sz,
+                              PyObject *py_dict)
 {
     int ret = -1;
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
@@ -1734,7 +1764,8 @@ InformixCdc_extract_record(InformixCdcObject *self, int payload_sz,
     PyObject *py_record_type = NULL;
 
     if (packet_scheme != PACKET_SCHEME) {
-        PyErr_SetString(PyExc_BufferError, "invalid Informix CDC packet scheme");
+        PyErr_SetString(PyExc_BufferError,
+                        "invalid Informix CDC packet scheme");
         goto except;
     }
 
@@ -1806,14 +1837,9 @@ InformixCdc_extract_record(InformixCdcObject *self, int payload_sz,
 
         default:
             strcpy(record_type, "CDC_REC_UNKNOWN");
-            //rc = -1;
-            rc = 0;
+            rc = -1;
             break;
     }
-    /* mem lead
-    strcpy(record_type, "CDC_REC_UNKNOWN");
-    rc = 0;
-    */
 
     if (rc != 0) {
         if (! PyErr_Occurred()) {
@@ -1870,10 +1896,14 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
     sprintf(conn_string, "%s@%s", self->syscdcdb, self->dbservername);
     if (conn_user && conn_passwd) {
-        EXEC SQL CONNECT TO :conn_string AS :conn_name USER :conn_user USING :conn_passwd;
+        EXEC SQL CONNECT TO :conn_string
+                         AS :conn_name
+                         USER :conn_user
+                         USING :conn_passwd;
     }
     else {
-        EXEC SQL CONNECT TO :conn_string AS :conn_name;
+        EXEC SQL CONNECT TO :conn_string
+                         AS :conn_name;
     }
 
     if (SQLCODE != 0) {
@@ -1931,7 +1961,8 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    static const char *kwlist[] = {"database", "owner", "table", "columns", NULL };
+    static const char *kwlist[] = {"database", "owner", "table",
+                                   "columns", NULL };
     if (! PyArg_ParseTupleAndKeywords(args, kwds, "ssss:enable",
                                       (char**)kwlist, &database, &owner,
                                       &table, &cdc_columns)) {
@@ -2032,7 +2063,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
         if (SQLCODE != 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_ins SQLCODE %d", SQLCODE);
+                    "cannot prepare informixcdc_opntxns_ins SQLCODE %d",
+                    SQLCODE);
             PyErr_SetString(PyExc_ValueError, err_str);
             goto except;
         }
@@ -2044,7 +2076,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
         if (SQLCODE != 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_upd SQLCODE %d", SQLCODE);
+                    "cannot prepare informixcdc_opntxns_upd SQLCODE %d",
+                    SQLCODE);
             PyErr_SetString(PyExc_ValueError, err_str);
             goto except;
         }
@@ -2055,7 +2088,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
         if (SQLCODE != 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_del SQLCODE %d", SQLCODE);
+                    "cannot prepare informixcdc_opntxns_del SQLCODE %d",
+                    SQLCODE);
             PyErr_SetString(PyExc_ValueError, err_str);
             goto except;
         }
@@ -2066,7 +2100,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
         if (SQLCODE != 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_lsttxn_ins SQLCODE %d", SQLCODE);
+                    "cannot prepare informixcdc_lsttxn_ins SQLCODE %d",
+                    SQLCODE);
             PyErr_SetString(PyExc_ValueError, err_str);
             goto except;
         }
@@ -2078,7 +2113,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 
         if (SQLCODE != 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_lsttxn_upd SQLCODE %d", SQLCODE);
+                    "cannot prepare informixcdc_lsttxn_upd SQLCODE %d",
+                    SQLCODE);
             PyErr_SetString(PyExc_ValueError, err_str);
             goto except;
         }
@@ -2154,9 +2190,10 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
     while (1) {
         if (self->bytes_in_buffer >= 16) {
-            // stop calling this as a function
+            // TODO: stop calling this as a function
             InformixCdc_extract_header(self->next_record_start, &header_sz,
-                                       &payload_sz, &packet_scheme, &record_number);
+                                       &payload_sz, &packet_scheme,
+                                       &record_number);
 
             record_sz = header_sz + payload_sz;
             if (self->bytes_in_buffer >= record_sz) {
@@ -2242,14 +2279,17 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
         // there isn't a full record in the buffer if we are here
         if (self->bytes_in_buffer > 0) {
-            memcpy(self->lo_buffer, self->next_record_start, self->bytes_in_buffer);
+            memcpy(self->lo_buffer,
+                   self->next_record_start,
+                   self->bytes_in_buffer);
         }
-        //bytes_read = fake_ifx_lo_read(self->session_id,
-        bytes_read = ifx_lo_read(self->session_id,
+        // TODO: make this a compile time flag with #define
+        bytes_read = IFX_LO_READ(self->session_id,
                                  &self->lo_buffer[self->bytes_in_buffer],
                                  self->lo_read_sz, &lo_read_err);
         if (bytes_read <= 0 || lo_read_err < 0) {
-            PyErr_SetString(PyExc_IOError, "read from Informix CDC SBLOB failed");
+            PyErr_SetString(PyExc_IOError,
+                            "read from Informix CDC SBLOB failed");
             goto except;
         }
         self->next_record_start = self->lo_buffer;
@@ -2291,24 +2331,36 @@ finally:
     return py_dict;
 }
 
+PyDoc_STRVAR(InformixCdc_connect__doc__,
+"connect(username, password) -> integer\n\n\
+Connect to the Informix engine.");
+
+PyDoc_STRVAR(InformixCdc_enable__doc__,
+"enable(database, owner, table, columns) -> integer\n\n\
+Define a table and list of columns to capture.");
+
+PyDoc_STRVAR(InformixCdc_activate__doc__,
+"activate(seq_number) -> integer\n\n\
+Start capture at current time or specific .");
+
 static PyMethodDef InformixCdc_methods[] = {
     {
         "connect",
         (PyCFunction)InformixCdc_connect,
         METH_VARARGS | METH_KEYWORDS,
-        PyDoc_STR("connect() -> None")
+        InformixCdc_connect__doc__
     },
     {
         "enable",
         (PyCFunction)InformixCdc_enable,
         METH_VARARGS | METH_KEYWORDS,
-        PyDoc_STR("enable() -> None")
+        InformixCdc_enable__doc__
     },
     {
         "activate",
         (PyCFunction)InformixCdc_activate,
         METH_VARARGS | METH_KEYWORDS,
-        PyDoc_STR("activate() -> None")
+        InformixCdc_activate__doc__
     },
     {   /* sentinel */
         NULL,
@@ -2320,95 +2372,93 @@ static PyTypeObject InformixCdc_Type = {
     /* The ob_type field must be initialized in the module init function
      * to be portable to Windows without using C++. */
     PyVarObject_HEAD_INIT(NULL, 0)
-    "informixcdcmodule.InformixCdc",             /*tp_name*/
-    sizeof(InformixCdcObject),          /*tp_basicsize*/
-    0,                          /*tp_itemsize*/
+    "informixcdcmodule.InformixCdc",            /*tp_name*/
+    sizeof(InformixCdcObject),                  /*tp_basicsize*/
+    0,                                          /*tp_itemsize*/
     /* methods */
-    (destructor)InformixCdc_dealloc, /*tp_dealloc*/
-    0,                          /*tp_print*/
-    0,                        /*tp_getattr*/
-    0,                        /*tp_setattr*/
-    0,                          /*tp_compare*/
-    0,                          /*tp_repr*/
-    0,                          /*tp_as_number*/
-    0,                          /*tp_as_sequence*/
-    0,                          /*tp_as_mapping*/
-    0,                          /*tp_hash*/
-    0,                      /*tp_call*/
-    0,                      /*tp_str*/
-    0,                      /*tp_getattro*/
-    0,                      /*tp_setattro*/
-    0,                      /*tp_as_buffer*/
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,     /*tp_flags*/
+    (destructor)InformixCdc_dealloc,            /*tp_dealloc*/
+    0,                                          /*tp_print*/
+    0,                                          /*tp_getattr*/
+    0,                                          /*tp_setattr*/
+    0,                                          /*tp_compare*/
+    0,                                          /*tp_repr*/
+    0,                                          /*tp_as_number*/
+    0,                                          /*tp_as_sequence*/
+    0,                                          /*tp_as_mapping*/
+    0,                                          /*tp_hash*/
+    0,                                          /*tp_call*/
+    0,                                          /*tp_str*/
+    0,                                          /*tp_getattro*/
+    0,                                          /*tp_setattro*/
+    0,                                          /*tp_as_buffer*/
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,   /*tp_flags*/
     "InformixCdc Objects",                      /*tp_doc*/
-    0,                      /*tp_traverse*/
-    0,                      /*tp_clear*/
-    0,                      /*tp_richcompare*/
-    0,                      /*tp_weaklistoffset*/
-    (getiterfunc)InformixCdc_iter,                      /*tp_iter*/
-    (iternextfunc)InformixCdc_iternext,                      /*tp_iternext*/
-    InformixCdc_methods,                      /*tp_methods*/
-    InformixCdc_members,                      /*tp_members*/
+    0,                                          /*tp_traverse*/
+    0,                                          /*tp_clear*/
+    0,                                          /*tp_richcompare*/
+    0,                                          /*tp_weaklistoffset*/
+    (getiterfunc)InformixCdc_iter,              /*tp_iter*/
+    (iternextfunc)InformixCdc_iternext,         /*tp_iternext*/
+    InformixCdc_methods,                        /*tp_methods*/
+    InformixCdc_members,                        /*tp_members*/
     InformixCdc_getseters,                      /*tp_getset*/
-    0,                      /*tp_base*/
-    0,                      /*tp_dict*/
-    0,                      /*tp_descr_get*/
-    0,                      /*tp_descr_set*/
-    0,                      /*tp_dictoffset*/
-    (initproc)InformixCdc_init,                      /*tp_init*/
-    0,                      /*tp_alloc*/
-    InformixCdc_new,                      /*tp_new*/
-    0,                      /*tp_free*/
-    0,                      /*tp_is_gc*/
+    0,                                          /*tp_base*/
+    0,                                          /*tp_dict*/
+    0,                                          /*tp_descr_get*/
+    0,                                          /*tp_descr_set*/
+    0,                                          /*tp_dictoffset*/
+    (initproc)InformixCdc_init,                 /*tp_init*/
+    0,                                          /*tp_alloc*/
+    InformixCdc_new,                            /*tp_new*/
+    0,                                          /*tp_free*/
+    0,                                          /*tp_is_gc*/
 };
 /* --------------------------------------------------------------------- */
-
-/* ---------- */
 
 static PyTypeObject Str_Type = {
     /* The ob_type field must be initialized in the module init function
      * to be portable to Windows without using C++. */
     PyVarObject_HEAD_INIT(NULL, 0)
-    "informixcdcmodule.Str",             /*tp_name*/
-    0,                          /*tp_basicsize*/
-    0,                          /*tp_itemsize*/
+    "informixcdcmodule.Str",                    /*tp_name*/
+    0,                                          /*tp_basicsize*/
+    0,                                          /*tp_itemsize*/
     /* methods */
-    0,                          /*tp_dealloc*/
-    0,                          /*tp_print*/
-    0,                          /*tp_getattr*/
-    0,                          /*tp_setattr*/
-    0,                          /*tp_compare*/
-    0,                          /*tp_repr*/
-    0,                          /*tp_as_number*/
-    0,                          /*tp_as_sequence*/
-    0,                          /*tp_as_mapping*/
-    0,                          /*tp_hash*/
-    0,                          /*tp_call*/
-    0,                          /*tp_str*/
-    0,                          /*tp_getattro*/
-    0,                          /*tp_setattro*/
-    0,                          /*tp_as_buffer*/
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /*tp_flags*/
-    0,                          /*tp_doc*/
-    0,                          /*tp_traverse*/
-    0,                          /*tp_clear*/
-    0,                          /*tp_richcompare*/
-    0,                          /*tp_weaklistoffset*/
-    0,                          /*tp_iter*/
-    0,                          /*tp_iternext*/
-    0,                          /*tp_methods*/
-    0,                          /*tp_members*/
-    0,                          /*tp_getset*/
-    0, /* see initxx */         /*tp_base*/
-    0,                          /*tp_dict*/
-    0,                          /*tp_descr_get*/
-    0,                          /*tp_descr_set*/
-    0,                          /*tp_dictoffset*/
-    0,                          /*tp_init*/
-    0,                          /*tp_alloc*/
-    0,                          /*tp_new*/
-    0,                          /*tp_free*/
-    0,                          /*tp_is_gc*/
+    0,                                          /*tp_dealloc*/
+    0,                                          /*tp_print*/
+    0,                                          /*tp_getattr*/
+    0,                                          /*tp_setattr*/
+    0,                                          /*tp_compare*/
+    0,                                          /*tp_repr*/
+    0,                                          /*tp_as_number*/
+    0,                                          /*tp_as_sequence*/
+    0,                                          /*tp_as_mapping*/
+    0,                                          /*tp_hash*/
+    0,                                          /*tp_call*/
+    0,                                          /*tp_str*/
+    0,                                          /*tp_getattro*/
+    0,                                          /*tp_setattro*/
+    0,                                          /*tp_as_buffer*/
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,   /*tp_flags*/
+    0,                                          /*tp_doc*/
+    0,                                          /*tp_traverse*/
+    0,                                          /*tp_clear*/
+    0,                                          /*tp_richcompare*/
+    0,                                          /*tp_weaklistoffset*/
+    0,                                          /*tp_iter*/
+    0,                                          /*tp_iternext*/
+    0,                                          /*tp_methods*/
+    0,                                          /*tp_members*/
+    0,                                          /*tp_getset*/
+    0, /* see initxx */                         /*tp_base*/
+    0,                                          /*tp_dict*/
+    0,                                          /*tp_descr_get*/
+    0,                                          /*tp_descr_set*/
+    0,                                          /*tp_dictoffset*/
+    0,                                          /*tp_init*/
+    0,                                          /*tp_alloc*/
+    0,                                          /*tp_new*/
+    0,                                          /*tp_free*/
+    0,                                          /*tp_is_gc*/
 };
 
 /* ---------- */
@@ -2424,75 +2474,54 @@ static PyTypeObject Null_Type = {
     /* The ob_type field must be initialized in the module init function
      * to be portable to Windows without using C++. */
     PyVarObject_HEAD_INIT(NULL, 0)
-    "informixcdcmodule.Null",            /*tp_name*/
-    0,                          /*tp_basicsize*/
-    0,                          /*tp_itemsize*/
+    "informixcdcmodule.Null",                   /*tp_name*/
+    0,                                          /*tp_basicsize*/
+    0,                                          /*tp_itemsize*/
     /* methods */
-    0,                          /*tp_dealloc*/
-    0,                          /*tp_print*/
-    0,                          /*tp_getattr*/
-    0,                          /*tp_setattr*/
-    0,                          /*tp_compare*/
-    0,                          /*tp_repr*/
-    0,                          /*tp_as_number*/
-    0,                          /*tp_as_sequence*/
-    0,                          /*tp_as_mapping*/
-    0,                          /*tp_hash*/
-    0,                          /*tp_call*/
-    0,                          /*tp_str*/
-    0,                          /*tp_getattro*/
-    0,                          /*tp_setattro*/
-    0,                          /*tp_as_buffer*/
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /*tp_flags*/
-    0,                          /*tp_doc*/
-    0,                          /*tp_traverse*/
-    0,                          /*tp_clear*/
-    null_richcompare,           /*tp_richcompare*/
-    0,                          /*tp_weaklistoffset*/
-    0,                          /*tp_iter*/
-    0,                          /*tp_iternext*/
-    0,                          /*tp_methods*/
-    0,                          /*tp_members*/
-    0,                          /*tp_getset*/
-    0, /* see initxx */         /*tp_base*/
-    0,                          /*tp_dict*/
-    0,                          /*tp_descr_get*/
-    0,                          /*tp_descr_set*/
-    0,                          /*tp_dictoffset*/
-    0,                          /*tp_init*/
-    0,                          /*tp_alloc*/
-    0, /* see initxx */         /*tp_new*/
-    0,                          /*tp_free*/
-    0,                          /*tp_is_gc*/
+    0,                                          /*tp_dealloc*/
+    0,                                          /*tp_print*/
+    0,                                          /*tp_getattr*/
+    0,                                          /*tp_setattr*/
+    0,                                          /*tp_compare*/
+    0,                                          /*tp_repr*/
+    0,                                          /*tp_as_number*/
+    0,                                          /*tp_as_sequence*/
+    0,                                          /*tp_as_mapping*/
+    0,                                          /*tp_hash*/
+    0,                                          /*tp_call*/
+    0,                                          /*tp_str*/
+    0,                                          /*tp_getattro*/
+    0,                                          /*tp_setattro*/
+    0,                                          /*tp_as_buffer*/
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,   /*tp_flags*/
+    0,                                          /*tp_doc*/
+    0,                                          /*tp_traverse*/
+    0,                                          /*tp_clear*/
+    null_richcompare,                           /*tp_richcompare*/
+    0,                                          /*tp_weaklistoffset*/
+    0,                                          /*tp_iter*/
+    0,                                          /*tp_iternext*/
+    0,                                          /*tp_methods*/
+    0,                                          /*tp_members*/
+    0,                                          /*tp_getset*/
+    0, /* see initxx */                         /*tp_base*/
+    0,                                          /*tp_dict*/
+    0,                                          /*tp_descr_get*/
+    0,                                          /*tp_descr_set*/
+    0,                                          /*tp_dictoffset*/
+    0,                                          /*tp_init*/
+    0,                                          /*tp_alloc*/
+    0, /* see initxx */                         /*tp_new*/
+    0,                                          /*tp_free*/
+    0,                                          /*tp_is_gc*/
 };
-
 
 /* ---------- */
 
-static PyObject *
-informixcdc_connect(PyObject *self, PyObject *args, PyObject *kwds) {
-    /* to be implemented */
-    Py_INCREF(Py_None);
-    return Py_None;
-}
-
 /* List of functions defined in the module */
 
-static PyMethodDef informixcdc_methods[] = {
-    {
-        "connect",
-        (PyCFunction)informixcdc_connect,
-        METH_NOARGS,
-        PyDoc_STR("connect() -> None")
-    },
-    {   /* sentinel */
-        NULL,
-        NULL
-    }
-};
-
 PyDoc_STRVAR(module_doc,
-"This is a module for Informix Change Data Capture.");
+"Informix Change Data Capture interface.");
 
 PyMODINIT_FUNC
 init_informixcdc(void)
@@ -2514,7 +2543,7 @@ init_informixcdc(void)
         return;
 
     /* Create the module and add the functions */
-    m = Py_InitModule3("_informixcdc", informixcdc_methods, module_doc);
+    m = Py_InitModule3("_informixcdc", NULL, module_doc);
     if (m == NULL) {
         return;
     }
