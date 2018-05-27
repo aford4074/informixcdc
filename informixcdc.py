@@ -9,8 +9,8 @@ class InformixCdc(_InformixCdc):
 
 def main():
     import pprint
-    cdc = InformixCdc('informix_1', timeout=1, max_records=20,
-                      lo_buffer_sz=1000, use_savepoints=False)
+    cdc = InformixCdc('informix_1', timeout=1, max_records=1,
+                      lo_buffer_sz=2048, use_savepoints=False)
 
     print 'connect()', cdc.connect('informix', 'informix')
     print 'is_connected', cdc.is_connected
@@ -32,7 +32,7 @@ def main():
     try:
         for record in cdc:
             counter += 1
-            if counter % 100 == 0:
+            if counter % 1 == 0:
                 print counter
                 pp.pprint(record)
 

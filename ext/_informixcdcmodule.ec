@@ -37,21 +37,13 @@
 #define PYDTINC1(f) PYDTINC2(f)
 #include PYDTINC1(PYTHON_INCLUDE/DATETIME_INCLUDE)
 
-EXEC SQL INCLUDE sqltypes;
-EXEC SQL INCLUDE sqlca;
+#include "informixesql.h"
+
+//EXEC SQL include sqltypes;
 
 #define DEFAULT_ID                 1
 #define DEFAULT_TIMEOUT            60
 #define DEFAULT_MAX_RECORDS        100
-#define DEFAULT_SYSCDCDB           "syscdcv1"
-#define CONNNAME_LEN               63
-#define CONNSTRING_LEN             511
-#define ERRSTR_LEN                 63
-
-#define MIN_LO_BUFFER_SZ           65536
-#define MAX_CDC_TABS               64
-#define MAX_CDC_COLS               64
-#define MAX_SQL_STMT_LEN           8191
 
 #define PACKET_SCHEME              66
 
@@ -61,6 +53,14 @@ EXEC SQL INCLUDE sqlca;
 #define RECORD_NUMBER_OFFSET       (PACKET_SCHEME_OFFSET + 4)
 #define RECORD_HEADER_OFFSET       (RECORD_NUMBER_OFFSET + 4)
 #define CHANGE_HEADER_SZ           20
+
+#define DEFAULT_SYSCDCDB           "syscdcv1"
+#define CONNNAME_LEN               63
+#define CONNSTRING_LEN             511
+#define ERRSTR_LEN                 63
+
+#define MIN_LO_BUFFER_SZ           65536
+
 
 /*
  * Informix CDC Record types
@@ -78,31 +78,6 @@ EXEC SQL INCLUDE sqlca;
 #define CDC_REC_TABSCHEM           200
 #define CDC_REC_TIMEOUT            201
 #define CDC_REC_ERROR              202
-
-EXEC SQL define TABLENAME_LEN      (255 + 1 + 255 + 1 + 255 + 1 + 255);
-EXEC SQL define COLARG_LEN         1024;
-EXEC SQL define CDC_MAJ_VER        1;
-EXEC SQL define CDC_MIN_VER        1;
-EXEC SQL define FULLROWLOG_OFF     0;
-EXEC SQL define FULLROWLOG_ON      1;
-
-/*
- * Structs for maintaining copies of sqlda structs
-*/
-
-typedef struct {
-    int col_type;
-    int col_xid;
-    int col_size;
-    char *col_name;
-} column_t;
-
-typedef struct {
-    char tabname[TABLENAME_LEN+1];
-    int num_cols;
-    int num_var_cols;
-    column_t columns[MAX_CDC_COLS];
-} table_t;
 
 /*
  * Nice macros for setting python objects to default values when parsing
@@ -140,7 +115,7 @@ typedef struct {
     int id;
     char name[CONNNAME_LEN+1];
     int is_connected;
-    $integer session_id;
+    int session_id;
     char dbservername[256];
     int timeout;
     int max_records;
@@ -166,8 +141,6 @@ static bigint ld8(const char *p);
 static double lddbl(const char *p, const int endianness);
 static float ldfloat(const char *p, const int endianness);
 static int get_platform_endianness(void);
-static bigint InformixCdc_query_restart_seq_number(const InformixCdcObject *self);
-static bigint InformixCdc_query_last_seq_number(const InformixCdcObject *self);
 
 static PyTypeObject InformixCdc_Type;
 
@@ -231,9 +204,7 @@ InformixCdc_dealloc(InformixCdcObject* self)
     }
 
     if (self->use_savepoints) {
-        EXEC SQL FREE informixcdc_opntxns_ins;
-        EXEC SQL FREE informixcdc_opntxns_upd;
-        EXEC SQL FREE informixcdc_opntxns_del;
+        free_prepares();
     }
 
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -473,30 +444,6 @@ finally:
     return py_string;
 }
 
-static int
-InformixCdc_set_connection(const InformixCdcObject *self)
-{
-    int rc = -1;
-    EXEC SQL BEGIN DECLARE SECTION;
-    const char *conn_name = self->name;
-    EXEC SQL END DECLARE SECTION;
-
-    EXEC SQL SET CONNECTION :conn_name;
-
-    if (SQLCODE != 0) {
-        PyErr_SetString(PyExc_RuntimeError, "cannot set connection");
-        goto except;
-    }
-    assert(! PyErr_Occurred());
-    rc = 0;
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    rc = -1;
-finally:
-    return rc;
-}
-
 /*
  * Threading support based largely on the informixdb module
  * http://informixdb.sourceforge.net/
@@ -573,202 +520,10 @@ static char* informixcdc_dbconn = NULL;
 #endif // IFXDB_MT
 
 #ifdef NDEBUG
-#define IFX_LO_READ ifx_lo_read
+#define IFX_LO_READ cdc_lo_read
 #else
 #define IFX_LO_READ mock_ifx_lo_read
 #endif
-
-static bigint
-InformixCdc_query_restart_seq_number(const InformixCdcObject *self)
-{
-    EXEC SQL BEGIN DECLARE SECTION;
-    int id = self->id;
-    bigint restart_seq_number = -1;
-    EXEC SQL END DECLARE SECTION;
-    char err_str[ERRSTR_LEN+1];
-
-    EXEC SQL PREPARE restart_seq_number FROM
-        "select nvl(min(seq_number), 0) from informixcdc_opntxns where id = ?";
-
-    if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot prepare restart_seq_number SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-
-    EXEC SQL EXECUTE restart_seq_number
-             INTO :restart_seq_number USING :id;
-
-    if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot execute restart_seq_number SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-    assert(! PyErr_Occurred());
-    assert(restart_seq_number >= 0);
-    assert(SQLCODE == 0);
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    restart_seq_number = -1;
-finally:
-    EXEC SQL FREE restart_seq_number;
-    return restart_seq_number;
-}
-
-static bigint
-InformixCdc_query_last_seq_number(const InformixCdcObject *self)
-{
-    EXEC SQL BEGIN DECLARE SECTION;
-    int id = self->id;
-    bigint last_seq_number = -1;
-    EXEC SQL END DECLARE SECTION;
-    char err_str[ERRSTR_LEN+1];
-
-    EXEC SQL PREPARE last_seq_number FROM
-        "select seq_number from informixcdc_lsttxn where id = ?";
-
-    if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot prepare last_seq_number SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-
-    EXEC SQL EXECUTE last_seq_number INTO :last_seq_number USING :id;
-
-    if (SQLCODE == SQLNOTFOUND) {
-        last_seq_number = 0;
-    }
-    else if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot execute last_seq_number SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-    assert(! PyErr_Occurred());
-    assert(last_seq_number >= 0);
-    assert(SQLCODE == 0);
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    last_seq_number = -1;
-finally:
-    EXEC SQL FREE last_seq_number;
-    return last_seq_number;
-}
-
-static int
-InformixCdc_upsert_opntxns(const InformixCdcObject *self)
-{
-    int ret = -1;
-    char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
-    char err_str[ERRSTR_LEN+1];
-    EXEC SQL BEGIN DECLARE SECTION;
-    int id = self->id;
-    bigint seq_number;
-    int transaction_id;
-    EXEC SQL END DECLARE SECTION;
-
-    seq_number = ld8(rec);
-    transaction_id = ld4(rec+8);
-
-    EXEC SQL EXECUTE informixcdc_opntxns_ins
-             USING :id, :transaction_id, :seq_number;
-
-    if (SQLCODE == -239 || SQLCODE == -268) {
-        EXEC SQL EXECUTE informixcdc_opntxns_upd
-                 USING :seq_number, :id, :transaction_id;
-    }
-    if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot upsert informixcdc_opntxns SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-    assert(! PyErr_Occurred());
-    assert(SQLCODE == 0);
-    ret = 0;
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    ret = -1;
-finally:
-    return ret;
-}
-
-static int
-InformixCdc_delete_opntxns(const InformixCdcObject *self)
-{
-    int ret = -1;
-    char err_str[ERRSTR_LEN+1];
-    char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
-    EXEC SQL BEGIN DECLARE SECTION;
-    int id = self->id;
-    int transaction_id;
-    EXEC SQL END DECLARE SECTION;
-
-    transaction_id = ld4(rec+8);
-
-    EXEC SQL EXECUTE informixcdc_opntxns_del
-             USING :id, :transaction_id;
-
-    if (SQLCODE != 0) {
-        snprintf(err_str, sizeof(err_str),
-                 "cannot delete informixcdc_opntxns SQLCODE %d", SQLCODE);
-        PyErr_SetString(PyExc_IndexError, err_str);
-        goto except;
-    }
-    assert(! PyErr_Occurred());
-    assert(SQLCODE == 0);
-    ret = 0;
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    ret = -1;
-finally:
-    return ret;
-}
-
-static int
-InformixCdc_upsert_lsttxn(const InformixCdcObject *self)
-{
-    int ret = -1;
-    char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
-    char err_str[ERRSTR_LEN+1];
-    EXEC SQL BEGIN DECLARE SECTION;
-    int id = self->id;
-    bigint seq_number;
-    EXEC SQL END DECLARE SECTION;
-
-    seq_number = ld8(rec);
-    if (seq_number > self->last_seq_number) {
-        EXEC SQL EXECUTE informixcdc_lsttxn_upd
-                 USING :seq_number, :id;
-
-        if (sqlca.sqlerrd[2] == 0) {
-            EXEC SQL EXECUTE informixcdc_lsttxn_ins
-                     USING :id, :seq_number;
-        }
-        if (SQLCODE != 0) {
-            snprintf(err_str, sizeof(err_str),
-                     "cannot upsert informixcdc_lsttxn SQLCODE %d", SQLCODE);
-            PyErr_SetString(PyExc_IndexError, err_str);
-            goto except;
-        }
-    }
-    assert(! PyErr_Occurred());
-    assert(SQLCODE == 0);
-    ret = seq_number;
-    goto finally;
-except:
-    assert(PyErr_Occurred());
-    ret = -1;
-finally:
-    return ret;
-}
 
 /* get rid of this function. it is useless */
 static void
@@ -810,7 +565,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
         goto except;
     }
 
-    // there is a memory leak in here...somewhere
+/*
     *advance_col = 0;
     switch (MASKNONULL(column->col_type)) {
         case SQLINT8:
@@ -1021,11 +776,9 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             }
             break;
 
-        /*
-         * lddecimal most likely causes a memory leak, probably because it
-         * is defined in Python and ESQL/C and we're calling the Python
-         * verion.
-         */
+        // lddecimal most likely causes a memory leak, probably because it
+        // is defined in Python and ESQL/C and we're calling the Python
+        // verion.
         case SQLMONEY:
         case SQLDECIMAL:
             // disable decimals
@@ -1065,11 +818,9 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
             }
             break;
 
-        /*
-         * lddecimal most likely causes a memory leak, probably because it
-         * is defined in Python and ESQL/C and we're calling the Python
-         * verion.
-         */
+        // lddecimal most likely causes a memory leak, probably because it
+        // is defined in Python and ESQL/C and we're calling the Python
+        // verion.
         case SQLDTIME:
         case SQLINTERVAL:
             // disable decimals
@@ -1082,7 +833,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
                 goto except;
             }
             break;
-            
+
             lddecimal(col, column->col_size, &(c_datetime.dt_dec));
             if (risnull(CDTIMETYPE, (char*)&(c_datetime.dt_dec))) {
                 py_value = Py_None;
@@ -1149,6 +900,7 @@ InformixCdc_extract_column_to_dict(const InformixCdcObject *self,
     assert(py_dict);
     Py_DECREF(py_name);
     Py_DECREF(py_value);
+*/
     goto finally;
 except:
     assert(PyErr_Occurred());
@@ -1722,85 +1474,34 @@ finally:
 static int
 InformixCdc_add_tabschema(InformixCdcObject *self)
 {
-    int ret = -1;
-    EXEC SQL BEGIN DECLARE SECTION;
-    char sql[MAX_SQL_STMT_LEN+1];
-    EXEC SQL END DECLARE SECTION;
+    int rc = -1;
 
     char *rec = self->next_record_start+RECORD_HEADER_OFFSET;
     int tabid = ld4(rec);
     int var_len_cols = ld4(rec + 16);
-    ifx_sqlda_t *sqlda = NULL;
     table_t *table;
-    int col;
+    char err_str[ERRSTR_LEN+1];
 
     if (tabid >= MAX_CDC_TABS) {
         PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
         goto except;
     }
 
-    table = &self->tables[tabid];
-    table->num_cols = 0;
-
-    sprintf(sql, "create temp table t_informixcdc (%s) with no log", rec+20);
-
-    EXEC SQL EXECUTE IMMEDIATE :sql;
-
-    if (SQLCODE != 0) {
-        PyErr_SetString(PyExc_Exception, "cannot create CDC temp table");
+    rc = add_tabschema(tabid, var_len_cols, rec+20, &self->tables[tabid]);
+    if (rc < 0) {
+        snprintf(err_str, sizeof(err_str),
+                 "cannot add table schems SQLCODE %d", rc);
+        PyErr_SetString(PyExc_Exception, err_str);
         goto except;
     }
-
-    EXEC SQL PREPARE informixcdc FROM "select * from t_informixcdc";
-
-    if (SQLCODE != 0) {
-        goto except;
-    }
-
-    EXEC SQL DESCRIBE informixcdc INTO sqlda;
-
-    if (SQLCODE != 0) {
-        goto except;
-    }
-
-    // can't find the header that defines rtypsize
-    for (col=0; col < sqlda->sqld; col++) {
-        table->columns[col].col_type = sqlda->sqlvar[col].sqltype;
-        table->columns[col].col_size =
-            rtypsize(sqlda->sqlvar[col].sqltype, sqlda->sqlvar[col].sqllen);
-        table->columns[col].col_xid = sqlda->sqlvar[col].sqlxid;
-        table->columns[col].col_name =
-            PyMem_Malloc(strlen(sqlda->sqlvar[col].sqlname)+1);
-        if (! table->columns[col].col_name) {
-            PyErr_SetString(PyExc_MemoryError, "cannot allocate column name");
-            goto except;
-        }
-        strcpy(table->columns[col].col_name, sqlda->sqlvar[col].sqlname);
-        table->num_cols++;
-    }
-    table->num_var_cols = var_len_cols;
-
-    EXEC SQL EXECUTE IMMEDIATE "drop table t_informixcdc";
-
-    // don't raise an error if we can't drop the temp table,
-    // the next attempt to add a table will fail with error
-
     assert(! PyErr_Occurred());
-    ret = 0;
+    assert(rc == 0);
     goto finally;
 except:
     assert(PyErr_Occurred());
-    if (tabid < MAX_CDC_TABS) {
-        table = &self->tables[tabid];
-        for (col=0; col < table->num_cols; col++) {
-            PyMem_Free(table->columns[col].col_name);
-        }
-    }
-    ret = -1;
+    rc = -1;
 finally:
-    free(sqlda);
-    EXEC SQL FREE informixcdc;
-    return ret;
+    return rc;
 }
 
 static PyObject*
@@ -1925,16 +1626,14 @@ finally:
 static PyObject *
 InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
-    EXEC SQL BEGIN DECLARE SECTION;
-    char conn_string[CONNSTRING_LEN+1];
+    char conn_string[500];
     char *conn_dbservername = self->dbservername;
     char *conn_name = self->name;
     char *conn_user = NULL;
     char *conn_passwd = NULL;
     long timeout = self->timeout;
     long max_records = self->max_records;
-    $integer session_id;
-    EXEC SQL END DECLARE SECTION;
+    int session_id;
     PyObject *ret = NULL;
 
     static const char *kwlist[] = { "user", "passwd", NULL };
@@ -1945,42 +1644,17 @@ InformixCdc_connect(InformixCdcObject *self, PyObject *args, PyObject *kwds)
     }
 
     sprintf(conn_string, "%s@%s", self->syscdcdb, self->dbservername);
-    if (conn_user && conn_passwd) {
-        EXEC SQL CONNECT TO :conn_string
-                         AS :conn_name
-                         USER :conn_user
-                         USING :conn_passwd;
+    session_id = cdc_connect(conn_string, conn_dbservername, conn_name,
+                          conn_user, conn_passwd, timeout, max_records);
+    if (session_id > 0) {
+        self->is_connected = 1;
+        self->session_id = session_id;
     }
-    else {
-        EXEC SQL CONNECT TO :conn_string
-                         AS :conn_name;
-    }
-
-    if (SQLCODE != 0) {
-        goto badsqlcode;
-    }
-
-    self->is_connected = 1;
-
-    EXEC SQL EXECUTE FUNCTION informix.cdc_opensess(
-        :conn_dbservername, 0, :timeout, :max_records, CDC_MAJ_VER, CDC_MIN_VER
-    ) INTO :session_id;
-
-    if (SQLCODE != 0) {
-        goto badsqlcode;
-    }
-    else if (session_id < 0) {
-        goto badsqlcode;
-    }
-
-    self->session_id = session_id;
-
-badsqlcode:
-    assert(! PyErr_Occurred());
-    ret = PyInt_FromLong(SQLCODE);
+    ret = PyInt_FromLong(session_id);
     if (ret == NULL) {
         goto except;
     }
+    assert(! PyErr_Occurred());
     assert(ret);
     goto finally;
 except:
@@ -1994,19 +1668,15 @@ finally:
 static PyObject *
 InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
-    EXEC SQL BEGIN DECLARE SECTION;
     char cdc_table[TABLENAME_LEN+1];
     char *cdc_columns = NULL;
-    int session_id = self->session_id;
-    int table_id = self->next_table_id;
-    int retval;
-    EXEC SQL END DECLARE SECTION;
+    int rc;
     const char *database = NULL;
     const char *owner = NULL;
     const char *table = NULL;
     PyObject *ret = NULL;
 
-    if (table_id >= MAX_CDC_TABS) {
+    if (self->next_table_id >= MAX_CDC_TABS) {
         PyErr_SetString(PyExc_IndexError, "max Informix CDC tables reached");
         return NULL;
     }
@@ -2018,53 +1688,19 @@ InformixCdc_enable(InformixCdcObject *self, PyObject *args, PyObject *kwds)
                                       &table, &cdc_columns)) {
         return NULL;
     }
+
     snprintf(cdc_table, TABLENAME_LEN, "%s:%s.%s", database, owner, table);
-
-    EXEC SQL EXECUTE FUNCTION informix.cdc_set_fullrowlogging(
-        :cdc_table, FULLROWLOG_ON
-    ) INTO :retval;
-
-    if (SQLCODE != 0) {
-        ret = PyInt_FromLong(SQLCODE);
-        if (ret == NULL) {
-            goto except;
-        }
-        goto finally;
-    }
-    else if (retval < 0) {
-        ret = PyInt_FromLong(retval);
-        if (ret == NULL) {
-            goto except;
-        }
-        goto finally;
-    }
-
-    EXEC SQL EXECUTE FUNCTION informix.cdc_startcapture(
-        :session_id, 0, :cdc_table, :cdc_columns, :table_id
-    ) INTO :retval;
-
-    if (SQLCODE != 0) {
-        ret = PyInt_FromLong(SQLCODE);
-        if (ret == NULL) {
-            goto except;
-        }
-        goto finally;
-    }
-    else if (retval < 0) {
-        ret = PyInt_FromLong(retval);
-        if (ret == NULL) {
-            goto except;
-        }
-        goto finally;
+    rc = cdc_enable(cdc_table, cdc_columns,
+                    self->session_id, self->next_table_id);
+    ret = PyInt_FromLong(rc);
+    if (ret == NULL) {
+        goto except;
     }
 
     snprintf(self->tables[self->next_table_id].tabname, TABLENAME_LEN,
              "%s@%s:%s.%s", database, self->dbservername, owner, table);
     self->next_table_id += 1;
-    ret = PyInt_FromLong(0);
-    if (ret == NULL) {
-        goto except;
-    }
+
     assert(! PyErr_Occurred());
     assert(ret);
     goto finally;
@@ -2079,12 +1715,9 @@ finally:
 static PyObject *
 InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 {
-    EXEC SQL BEGIN DECLARE SECTION;
-    $integer session_id = self->session_id;
     bigint seq_number = -1;
-    $integer retval = -1;
-    EXEC SQL END DECLARE SECTION;
     char err_str[ERRSTR_LEN+1];
+    int rc;
     PyObject *ret = NULL;
 
     static const char *kwlist[] = {"seq_number", NULL };
@@ -2102,73 +1735,23 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         goto except;
     }
     if (self->use_savepoints) {
-        self->last_seq_number = InformixCdc_query_last_seq_number(self);
+        self->last_seq_number = query_last_seq_number(self->id);
         if (self->last_seq_number < 0) {
+            snprintf(err_str, sizeof(err_str),
+                    "cannot query restart last sequence number SQLCODE %ld",
+                    self->last_seq_number);
+            PyErr_SetString(PyExc_IndexError, err_str);
             goto except;
         }
-
-        EXEC SQL PREPARE informixcdc_opntxns_ins FROM
-            "insert into informixcdc_opntxns (id, transaction_id, seq_number) \
-                values (?, ?, ?)";
-
-        if (SQLCODE != 0) {
+        rc = prepare_savepoints();
+        if (rc < 0) {
             snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_ins SQLCODE %d",
-                    SQLCODE);
-            PyErr_SetString(PyExc_ValueError, err_str);
-            goto except;
-        }
-
-        EXEC SQL PREPARE informixcdc_opntxns_upd FROM
-            "update informixcdc_opntxns \
-             set seq_number = ? \
-             where id = ? and transaction_id = ?";
-
-        if (SQLCODE != 0) {
-            snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_upd SQLCODE %d",
-                    SQLCODE);
-            PyErr_SetString(PyExc_ValueError, err_str);
-            goto except;
-        }
-
-        EXEC SQL PREPARE informixcdc_opntxns_del FROM
-            "delete from informixcdc_opntxns \
-             where id = ? and transaction_id = ?";
-
-        if (SQLCODE != 0) {
-            snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_opntxns_del SQLCODE %d",
-                    SQLCODE);
-            PyErr_SetString(PyExc_ValueError, err_str);
-            goto except;
-        }
-
-        EXEC SQL PREPARE informixcdc_lsttxn_ins FROM
-            "insert into informixcdc_lsttxn (id, seq_number) \
-                values (?, ?)";
-
-        if (SQLCODE != 0) {
-            snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_lsttxn_ins SQLCODE %d",
-                    SQLCODE);
-            PyErr_SetString(PyExc_ValueError, err_str);
-            goto except;
-        }
-
-        EXEC SQL PREPARE informixcdc_lsttxn_upd FROM
-            "update informixcdc_lsttxn \
-             set seq_number = ? \
-             where id = ?";
-
-        if (SQLCODE != 0) {
-            snprintf(err_str, sizeof(err_str),
-                    "cannot prepare informixcdc_lsttxn_upd SQLCODE %d",
-                    SQLCODE);
-            PyErr_SetString(PyExc_ValueError, err_str);
+                    "cannot prepare savepoints SQLCODE %d", rc);
+            PyErr_SetString(PyExc_IndexError, err_str);
             goto except;
         }
     }
+
     /*
      * use_savepoints seq_number   action
      * yes            -1 (default) seq_number from db. fail on err,
@@ -2180,8 +1763,12 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
      */
     if (seq_number == -1) {
         if (self->use_savepoints) {
-            seq_number = InformixCdc_query_restart_seq_number(self);
+            seq_number = query_restart_seq_number(self->id);
             if (seq_number < 0) {
+                snprintf(err_str, sizeof(err_str),
+                         "cannot query restart seq_number SQLCODE %ld",
+                         seq_number);
+                PyErr_SetString(PyExc_IndexError, err_str);
                 goto except;
             }
             else if (seq_number == 0 && self->last_seq_number != 0) {
@@ -2193,19 +1780,8 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
         }
     }
 
-    EXEC SQL EXECUTE FUNCTION informix.cdc_activatesess(
-        :session_id, :seq_number
-    ) INTO :retval;
-
-    if (retval < 0) {
-        ret = PyInt_FromLong(retval);
-        if (ret == NULL) {
-            goto except;
-        }
-        goto finally;
-    }
-
-    ret = PyInt_FromLong(SQLCODE);
+    rc = cdc_activate(self->session_id, seq_number);
+    ret = PyInt_FromLong(rc);
     if (ret == NULL) {
         goto except;
     }
@@ -2215,11 +1791,7 @@ InformixCdc_activate(InformixCdcObject *self, PyObject *args, PyObject *kwds)
 except:
     assert(PyErr_Occurred());
     Py_XDECREF(ret);
-    EXEC SQL FREE informixcdc_opntxns_ins;
-    EXEC SQL FREE informixcdc_opntxns_upd;
-    EXEC SQL FREE informixcdc_opntxns_del;
-    EXEC SQL FREE informixcdc_lsttxn_ins;
-    EXEC SQL FREE informixcdc_lsttxn_upd;
+    free_prepares();
     ret = NULL;
 finally:
     return ret;
@@ -2228,6 +1800,7 @@ finally:
 static PyObject *
 InformixCdc_fetchone(InformixCdcObject *self)
 {
+    char *rec;
     int bytes_read;
 #ifdef OWRITESBLOB
     int bytes_written;
@@ -2240,8 +1813,8 @@ InformixCdc_fetchone(InformixCdcObject *self)
     int4 record_sz;
     int rc;
     PyObject *py_dict = NULL;
-
     while (1) {
+        printf("hi\n");
         if (self->bytes_in_buffer >= 16) {
             // TODO: stop calling this as a function
             InformixCdc_extract_header(self->next_record_start, &header_sz,
@@ -2258,8 +1831,11 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
                 switch (record_number) {
                     case CDC_REC_BEGINTX:
+                        rec = self->next_record_start+RECORD_HEADER_OFFSET;
                         if (self->use_savepoints) {
-                            rc = InformixCdc_upsert_opntxns(self);
+                            rc = upsert_opntxns(self->id,
+                                                self->last_seq_number,
+                                                ld4(rec+8));
                             if (rc != 0) {
                                 goto except;
                             }
@@ -2268,30 +1844,14 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
                     case CDC_REC_COMMTX:
                         if (self->use_savepoints) {
-                            EXEC SQL BEGIN WORK;
+                            rec = self->next_record_start+RECORD_HEADER_OFFSET;
+                            rc = commtx_savepoint(self->id,
+                                                  self->last_seq_number,
+                                                  ld4(rec+8));
 
-                            if (SQLCODE != 0) {
-                                PyErr_SetString(PyExc_RuntimeError,
-                                                "cannot begin transaction");
-                                goto except;
-                            }
-                            rc = InformixCdc_delete_opntxns(self);
                             if (rc != 0) {
-                                EXEC SQL ROLLBACK WORK;
-                                goto except;
-                            }
-                            rc = InformixCdc_upsert_lsttxn(self);
-                            if (rc < 0) {
-                                EXEC SQL ROLLBACK WORK;
-                                goto except;
-                            }
-
-                            EXEC SQL COMMIT WORK;
-
-                            if (SQLCODE != 0) {
-                                EXEC SQL ROLLBACK WORK;
                                 PyErr_SetString(PyExc_RuntimeError,
-                                                "cannot commit transaction");
+                                                "cannot commtx savepoint");
                                 goto except;
                             }
                             self->last_seq_number = rc;
@@ -2300,8 +1860,13 @@ InformixCdc_fetchone(InformixCdcObject *self)
 
                     case CDC_REC_RBTX:
                         if (self->use_savepoints) {
-                            rc = InformixCdc_delete_opntxns(self);
+                            rec = self->next_record_start+RECORD_HEADER_OFFSET;
+                            rc = rbtx_savepoint(self->id,
+                                                ld4(rec+8));
+
                             if (rc != 0) {
+                                PyErr_SetString(PyExc_RuntimeError,
+                                                "cannot rbtx savepoint");
                                 goto except;
                             }
                         }
